@@ -134,13 +134,21 @@ SkipCM:
         If pre3 = "end" Then
             lSearch = lPos + 6
         Else
-            ' Skip past "stream" keyword then mandatory EOL
+            ' Skip past "stream" keyword then EOL (PDF spec: \r\n or \n;
+            ' tolerate leading spaces/tabs before the EOL as some generators emit them)
             lStart = lPos + 6
+            Do While lStart <= Len(sRaw)   ' skip spaces and tabs before EOL
+                If bFile(lStart - 1) = 32 Or bFile(lStart - 1) = 9 Then
+                    lStart = lStart + 1
+                Else
+                    Exit Do
+                End If
+            Loop
             If lStart <= Len(sRaw) Then
-                If bFile(lStart - 1) = 13 Then lStart = lStart + 1
+                If bFile(lStart - 1) = 13 Then lStart = lStart + 1  ' skip \r
             End If
             If lStart <= Len(sRaw) Then
-                If bFile(lStart - 1) = 10 Then lStart = lStart + 1
+                If bFile(lStart - 1) = 10 Then lStart = lStart + 1  ' skip \n
             End If
 
             lEnd = InStr(lStart, sRaw, "endstream", vbBinaryCompare)
@@ -237,7 +245,7 @@ Private Function PDF_DecompressDeflate(bIn() As Byte) As Byte()
     Dim bEmpty(0)    As Byte
     lSkip = 0
     If UBound(bIn) >= 1 Then
-        If bIn(0) = &H78 Then lSkip = 2   ' strip zlib 2-byte header (0x78 CMF)
+        If (bIn(0) And &H0F) = 8 Then lSkip = 2  ' strip zlib 2-byte header (CM=8 = deflate)
     End If
     If UBound(bIn) - lSkip < 0 Then GoTo Fail
     PDF_DecompressDeflate = VBA_Inflate(bIn, lSkip)
@@ -1199,6 +1207,13 @@ Public Function PDF_DiagnoseStreams(ByVal sFilePath As String) As String
         Else
             n = n + 1
             lStart = lPos + 6
+            Do While lStart <= Len(sRaw)
+                If bFile(lStart - 1) = 32 Or bFile(lStart - 1) = 9 Then
+                    lStart = lStart + 1
+                Else
+                    Exit Do
+                End If
+            Loop
             If bFile(lStart - 1) = 13 Then lStart = lStart + 1
             If bFile(lStart - 1) = 10 Then lStart = lStart + 1
             lEnd = InStr(lStart, sRaw, "endstream", vbBinaryCompare)
