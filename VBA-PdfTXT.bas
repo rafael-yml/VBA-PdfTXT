@@ -205,26 +205,30 @@ SkipCM:
                         bStream(iByte) = bFile(lStart - 1 + iByte)
                     Next iByte
 
-                    If InStr(1, sHeader, "/FlateDecode", vbBinaryCompare) > 0 Or _
-                       InStr(1, sHeader, "/Fl ",         vbBinaryCompare) > 0 Or _
-                       InStr(1, sHeader, "/Fl>",         vbBinaryCompare) > 0 Or _
-                       InStr(1, sHeader, "/Fl/",         vbBinaryCompare) > 0 Then
-                        bStream = PDF_DecompressDeflate(bStream)
-                    ElseIf InStr(1, sHeader, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/A85 ",          vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/A85>",          vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/A85/",          vbBinaryCompare) > 0 Then
-                        bStream = PDF_DecodeASCII85(bStream)
-                    ElseIf InStr(1, sHeader, "/LZWDecode", vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/LZW ",      vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/LZW>",      vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/LZW/",      vbBinaryCompare) > 0 Then
-                        bStream = PDF_DecodeLZW(bStream)
-                    ElseIf InStr(1, sHeader, "/RunLengthDecode", vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/RL ",             vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/RL>",             vbBinaryCompare) > 0 Or _
-                           InStr(1, sHeader, "/RL/",             vbBinaryCompare) > 0 Then
-                        bStream = PDF_DecodeRunLength(bStream)
+                    ' Apply filters sequentially in array order (PDF spec §7.4).
+                    ' A filter chain like [/ASCII85Decode /FlateDecode] is decoded
+                    ' left-to-right: A85 first, then Deflate.  The old ElseIf chain
+                    ' only applied the first matched filter; this loop handles chains.
+                    ' PDF_ExtractFilters returns a comma-separated list of canonical
+                    ' filter tokens found in sHeader, in document order.
+                    Dim sFilters   As String
+                    Dim aFilters() As String
+                    Dim iFilter    As Integer
+                    Dim sF         As String
+                    sFilters = PDF_ExtractFilters(sHeader)
+                    If Len(sFilters) > 0 Then
+                        aFilters = Split(sFilters, ",")
+                        For iFilter = 0 To UBound(aFilters)
+                            sF = aFilters(iFilter)
+                            Select Case sF
+                                Case "Fl"  : bStream = PDF_DecompressDeflate(bStream)
+                                Case "A85" : bStream = PDF_DecodeASCII85(bStream)
+                                Case "AHx" : bStream = PDF_DecodeASCIIHex(bStream)
+                                Case "LZW" : bStream = PDF_DecodeLZW(bStream)
+                                Case "RL"  : bStream = PDF_DecodeRunLength(bStream)
+                            End Select
+                            If UBound(bStream) = 0 Then Exit For  ' decode failed
+                        Next iFilter
                     End If
 
                     If UBound(bStream) > 0 Then
@@ -242,6 +246,175 @@ SkipCM:
     Loop
 
     PDF_ProcessAllStreams = PDF_SortAndJoin(sAllRuns)
+End Function
+
+' ---------------------------------------------------------------------------
+' PDF_ExtractFilters
+' Parses the /Filter entry from a stream dictionary header and returns the
+' filter names as a comma-separated string of canonical short tokens, in
+' document order (= decode order per PDF spec §7.4).
+'
+' Canonical tokens returned:
+'   Fl   FlateDecode / /Fl abbreviation
+'   A85  ASCII85Decode / /A85 abbreviation
+'   AHx  ASCIIHexDecode / /AHx abbreviation
+'   LZW  LZWDecode / /LZW abbreviation
+'   RL   RunLengthDecode / /RL abbreviation
+'   (image-only filters /DCT /JPX /CCF /JBIG2 are ignored)
+'
+' Handles scalar "/Filter /FlateDecode" and array "/Filter [/A85 /Fl]" forms.
+' Returns "" if no supported filter is found.
+' ---------------------------------------------------------------------------
+Private Function PDF_ExtractFilters(ByVal sHeader As String) As String
+    Dim lFilt   As Long
+    Dim lAfter  As Long
+    Dim lEnd    As Long
+    Dim sBlock  As String
+    Dim aParts() As String
+    Dim iPart   As Integer
+    Dim sName   As String
+    Dim sResult As String
+    Dim c       As String
+
+    PDF_ExtractFilters = ""
+
+    lFilt = InStr(1, sHeader, "/Filter", vbBinaryCompare)
+    If lFilt = 0 Then Exit Function
+
+    ' Skip "/Filter" and whitespace
+    lAfter = lFilt + 7
+    Do While lAfter <= Len(sHeader)
+        c = Mid$(sHeader, lAfter, 1)
+        If c = " " Or c = Chr(9) Or c = Chr(10) Or c = Chr(13) Then
+            lAfter = lAfter + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    If lAfter > Len(sHeader) Then Exit Function
+
+    c = Mid$(sHeader, lAfter, 1)
+    If c = "[" Then
+        ' Array form: collect everything up to "]"
+        lEnd = InStr(lAfter, sHeader, "]", vbBinaryCompare)
+        If lEnd = 0 Then lEnd = Len(sHeader) + 1
+        sBlock = Mid$(sHeader, lAfter + 1, lEnd - lAfter - 1)
+    ElseIf c = "/" Then
+        ' Scalar form: read one token
+        sBlock = Mid$(sHeader, lAfter, Len(sHeader) - lAfter + 1)
+        lEnd = InStr(1, sBlock, " ")
+        If lEnd > 0 Then sBlock = Left$(sBlock, lEnd - 1)
+    Else
+        Exit Function
+    End If
+
+    ' Walk tokens (each begins with "/")
+    aParts = Split(sBlock, "/")
+    sResult = ""
+    For iPart = 0 To UBound(aParts)
+        sName = Trim$(aParts(iPart))
+        ' Strip trailing delimiters
+        If Len(sName) > 0 Then
+            Do While Len(sName) > 0
+                c = Right$(sName, 1)
+                If c = " " Or c = Chr(9) Or c = Chr(10) Or c = Chr(13) Or _
+                   c = ">" Or c = "<" Or c = "/" Then
+                    sName = Left$(sName, Len(sName) - 1)
+                Else
+                    Exit Do
+                End If
+            Loop
+        End If
+        Dim sToken As String
+        sToken = ""
+        Select Case sName
+            Case "FlateDecode",    "Fl"  : sToken = "Fl"
+            Case "ASCII85Decode",  "A85" : sToken = "A85"
+            Case "ASCIIHexDecode", "AHx" : sToken = "AHx"
+            Case "LZWDecode",      "LZW" : sToken = "LZW"
+            Case "RunLengthDecode","RL"  : sToken = "RL"
+            ' Image-only and encryption filters — skip silently
+            Case "DCTDecode",  "DCT", "JPXDecode", "JPX", _
+                 "CCITTFaxDecode", "CCF", "JBIG2Decode", "Crypt"
+                sToken = ""
+        End Select
+        If Len(sToken) > 0 Then
+            If Len(sResult) > 0 Then sResult = sResult & ","
+            sResult = sResult & sToken
+        End If
+    Next iPart
+
+    PDF_ExtractFilters = sResult
+End Function
+
+' ---------------------------------------------------------------------------
+' PDF_DecodeASCIIHex  (PDF spec §7.4.1)
+' Each byte is encoded as two hexadecimal digits (upper or lower case).
+' Whitespace between hex pairs is ignored.  '>' marks end-of-data.
+' Odd final nibble is padded with 0 on the right (spec §7.4.1, table 4 note).
+' ---------------------------------------------------------------------------
+Private Function PDF_DecodeASCIIHex(bIn() As Byte) As Byte()
+    Dim bOut()   As Byte
+    Dim lInLen   As Long
+    Dim lOutMax  As Long
+    Dim lOutPos  As Long
+    Dim iByte    As Long
+    Dim b        As Byte
+    Dim nib1     As Integer
+    Dim nib2     As Integer
+    Dim bHasNib1 As Boolean
+
+    lInLen  = UBound(bIn) + 1
+    lOutMax = (lInLen \ 2) + 1
+    ReDim bOut(0 To lOutMax)
+    lOutPos  = 0
+    bHasNib1 = False
+    nib1     = 0
+
+    For iByte = 0 To lInLen - 1
+        b = bIn(iByte)
+        Select Case b
+            Case 62   ' '>' = EOD
+                Exit For
+            Case 48 To 57   ' '0'-'9'
+                Dim nVal As Integer
+                nVal = b - 48
+                GoTo ApplyNibble
+            Case 65 To 70   ' 'A'-'F'
+                nVal = b - 55
+                GoTo ApplyNibble
+            Case 97 To 102  ' 'a'-'f'
+                nVal = b - 87
+                GoTo ApplyNibble
+            Case 32, 9, 10, 13  ' whitespace — skip
+                ' nothing
+        End Select
+        GoTo NextByte
+ApplyNibble:
+        If Not bHasNib1 Then
+            nib1     = nVal
+            bHasNib1 = True
+        Else
+            nib2 = nVal
+            bOut(lOutPos) = CByte(nib1 * 16 + nib2)
+            lOutPos  = lOutPos + 1
+            bHasNib1 = False
+        End If
+NextByte:
+    Next iByte
+
+    ' Odd final nibble: pad with 0
+    If bHasNib1 Then
+        bOut(lOutPos) = CByte(nib1 * 16)
+        lOutPos = lOutPos + 1
+    End If
+
+    If lOutPos = 0 Then
+        ReDim bOut(0 To 0)
+    Else
+        ReDim Preserve bOut(0 To lOutPos - 1)
+    End If
+    PDF_DecodeASCIIHex = bOut
 End Function
 
 ' ---------------------------------------------------------------------------
