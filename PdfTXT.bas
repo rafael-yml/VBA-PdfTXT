@@ -47,7 +47,7 @@ Private Function PDF_BytesToLatin1(bData() As Byte) As String
 End Function
 
 Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As String
-    ' Linear stream scan - XREF ignored. Incremental-update duplicates handled downstream.
+    ' old amounts are a theoretical risk.
     Dim lPos         As Long
     Dim lStart       As Long
     Dim lEnd         As Long
@@ -74,10 +74,10 @@ Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As Strin
     Dim sCMText   As String
     Dim sAllRuns  As String
     Dim sCMParsed As String
-    ' Pass 0: CMaps from Object Streams (PDF 1.5+ /ObjStm - Chrome, Word, LibreOffice).
+    ' Pass 0: extract CMaps from ObjStm streams (PDF 1.5+).
     sCMapData = PDF_ExtractObjStmCMaps(bFile, sRaw)
     lCMScan = 1
-    ' Pass 1: ToUnicode CMaps from regular streams - merged with Pass 0 results.
+    ' Pass 1: collect ToUnicode CMaps from regular streams.
     Do
         lCMPos = InStr(lCMScan, sRaw, "stream", vbBinaryCompare)
         If lCMPos = 0 Then Exit Do
@@ -85,7 +85,6 @@ Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As Strin
             If Mid$(sRaw, lCMPos - 3, 3) = "end" Then lCMScan = lCMPos + 6: GoTo SkipCM
         End If
         lCMS = lCMPos + 6
-        ' EOL after 'stream' keyword: skip spaces/tabs then \r\n or \n
         Do While lCMS <= Len(sRaw)
             If bFile(lCMS - 1) = 32 Or bFile(lCMS - 1) = 9 Then
                 lCMS = lCMS + 1
@@ -186,7 +185,6 @@ SkipCM:
 
             If lLen > 0 And lLen < 50000000 Then
 
-                ' Scan back to opening << of this object's own dictionary
                 lScan = lPos - 1
                 lDictOpen = 0
                 Do While lScan > 0
@@ -259,9 +257,7 @@ SkipCM:
 End Function
 
 Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As String
-    ' ObjStm (PDF 1.5+): compressed bundle of objects (metadata/fonts, no content bytes).
-    ' Scans Part 2 for ToUnicode CMaps missing from regular stream pass.
-    ' /Extends chaining not supported - falls back to Tier2/3 gracefully.
+    ' ObjStm (PDF 1.5+): scan for ToUnicode CMaps inside compressed object bundles.
     Dim lSearch  As Long
     Dim lPos     As Long
     Dim lScan    As Long
@@ -294,7 +290,6 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
             GoTo NextObjStm
         End If
 
-        ' Find this stream's dictionary
         lScan = lPos - 1: lDO = 0
         Do While lScan > 0
             If Mid$(sRaw, lScan, 2) = "<<" Then lDO = lScan: Exit Do
@@ -304,14 +299,13 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
         If lDO = 0 Then lHS = IIf(lPos - 512 < 1, 1, lPos - 512) Else lHS = lDO
         sHeader = Mid$(sRaw, lHS, lPos - lHS)
 
-        ' Only process ObjStm streams
         If InStr(1, sHeader, "/Type /ObjStm",  vbBinaryCompare) = 0 And _
            InStr(1, sHeader, "/Type/ObjStm",   vbBinaryCompare) = 0 Then
             lSearch = lPos + 6
             GoTo NextObjStm
         End If
 
-        ' Read /First - byte offset in decompressed stream where Part 2 begins
+        ' Read /First  - byte offset in decompressed stream where Part 2 begins
         lFirst = 0
         lFPos = InStr(1, sHeader, "/First", vbBinaryCompare)
         If lFPos > 0 Then
@@ -332,7 +326,6 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
             If lFEnd > lFPos Then lFirst = CLng(Val(Mid$(sHeader, lFPos, lFEnd - lFPos)))
         End If
 
-        ' Locate stream body
         lStart = lPos + 6
         Do While lStart <= Len(sRaw)
             If bFile(lStart - 1) = 32 Or bFile(lStart - 1) = 9 Then
@@ -391,8 +384,6 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
 
             If UBound(bDec) > lFirst Then
                 sDecomp = PDF_BytesToLatin1(bDec)
-                ' Part 2 starts at /First bytes into the decompressed stream.
-                ' Part 1 (offset table) before /First is just "objnum offset" pairs - no CMaps.
                 sPart2 = Mid$(sDecomp, lFirst + 1)
                 If InStr(1, sPart2, "beginbfchar",  vbBinaryCompare) > 0 Or _
                    InStr(1, sPart2, "beginbfrange", vbBinaryCompare) > 0 Then
@@ -418,7 +409,7 @@ Private Sub PDF_ParseDecodeParms(ByVal sHeader As String, _
                                   ByRef nPredictor  As Long, _
                                   ByRef nColumns    As Long, _
                                   Optional ByRef nEarlyChange As Long = 1)
-    ' Parses /Predictor, /Columns, /EarlyChange from stream dict. Returns spec defaults if absent.
+    ' Parses /Predictor, /Columns (/FlateDecode) and /EarlyChange (/LZWDecode) from header.
     Dim lP   As Long
     Dim lC   As Long
     Dim lEnd As Long
@@ -489,8 +480,7 @@ End Sub
 Private Function PDF_ApplyPredictor(bData() As Byte, _
                                      ByVal nPredictor As Long, _
                                      ByVal nColumns   As Long) As Byte()
-    ' Reverses FlateDecode predictor (PDF spec Table 8).
-    ' 1=no-op, 2=TIFF horizontal diff, 10-15=PNG filters (filter byte per row).
+    ' Reverses FlateDecode PNG (10-15) and TIFF (2) predictor encoding.
     Dim nLen   As Long
     Dim bOut() As Byte
     Dim i      As Long
@@ -512,8 +502,6 @@ Private Function PDF_ApplyPredictor(bData() As Byte, _
     End If
 
     If nPredictor = 2 Then
-        ' TIFF predictor: each row is nColumns bytes; subtract left neighbour to encode,
-        ' so add left neighbour to decode.
         bOut = bData
         For i = 0 To nLen - 1
             If (i Mod nColumns) > 0 Then
@@ -525,12 +513,10 @@ Private Function PDF_ApplyPredictor(bData() As Byte, _
     End If
 
     If nPredictor >= 10 And nPredictor <= 15 Then
-        ' PNG predictor: each input row = 1 filter byte + nColumns data bytes.
-        ' Output row = nColumns bytes (filter byte consumed).
         Dim rowStride As Long
         rowStride = nColumns + 1
         If nLen Mod rowStride <> 0 Then
-            ' Malformed stream - return as-is and let text extraction fail naturally
+            ' Malformed stream  - return as-is and let text extraction fail naturally
             PDF_ApplyPredictor = bData
             Exit Function
         End If
@@ -574,12 +560,11 @@ Private Function PDF_ApplyPredictor(bData() As Byte, _
                             pr = c
                         End If
                         bOut(outOff + col) = CByte((raw + pr) And 255)
-                    Case Else  ' Unknown filter - treat as None
+                    Case Else  ' Unknown filter  - treat as None
                         bOut(outOff + col) = CByte(raw And 255)
                 End Select
             Next col
 
-            ' Save this output row as prevRow for next iteration
             For col = 0 To nColumns - 1
                 prevRow(col) = CLng(bOut(outOff + col))
             Next col
@@ -589,16 +574,12 @@ Private Function PDF_ApplyPredictor(bData() As Byte, _
         Exit Function
     End If
 
-    ' Unknown predictor value - return unchanged
+    ' Unknown predictor - return unchanged.
     PDF_ApplyPredictor = bData
 End Function
 
-' When a stream dict writes /Filter as an indirect reference (e.g. SAP NetWeaver:
-' "/Filter 6 0 R") instead of inline "/Filter /FlateDecode", the header string
-' contains no literal filter name. This function resolves up to one level: if
-' sHeader contains "/Filter N M R", it locates "N M obj" in sRaw and appends the
-' object body to the returned string so callers can InStr-check for /FlateDecode.
-' sRaw is the full file as Latin-1. Returns sHeader unchanged if no ref is found.
+' Resolves an indirect /Filter reference (e.g. SAP NetWeaver: "/Filter 6 0 R").
+' Returns sHeader unchanged if no indirect reference is found.
 Private Function PDF_ResolveFilterRef(ByVal sHeader As String, _
                                       ByVal sRaw    As String) As String
     Dim lF   As Long
@@ -631,7 +612,6 @@ Private Function PDF_ResolveFilterRef(ByVal sHeader As String, _
     Loop
     If lEnd = lN Then PDF_ResolveFilterRef = sHeader: Exit Function
     Dim sObjNum As String: sObjNum = Mid$(sHeader, lN, lEnd - lN)
-    ' Locate the object definition in sRaw
     Dim sFind As String: sFind = Chr(10) & sObjNum & " "
     lO = InStr(1, sRaw, sFind, vbBinaryCompare)
     If lO = 0 Then sFind = Chr(13) & sObjNum & " ": lO = InStr(1, sRaw, sFind, vbBinaryCompare)
@@ -651,7 +631,7 @@ Private Function PDF_IsContentStream(ByVal sHeader As String) As Boolean
     If InStr(1, sHeader, "/JBIG2Decode",       vbBinaryCompare) > 0 Then Exit Function
     If InStr(1, sHeader, "/JPXDecode",         vbBinaryCompare) > 0 Then Exit Function
     If InStr(1, sHeader, "/EmbeddedFile",      vbBinaryCompare) > 0 Then Exit Function
-    ' /Length1 and /FontFile identify font binary streams reliably.
+    ' /FontFile and /Length1 reliably identify font binary streams.
     If InStr(1, sHeader, "/FontFile",          vbBinaryCompare) > 0 Then Exit Function
     If InStr(1, sHeader, "/Length1",           vbBinaryCompare) > 0 Then Exit Function
     If InStr(1, sHeader, "/Length2",           vbBinaryCompare) > 0 Then Exit Function
@@ -662,6 +642,13 @@ Private Function PDF_IsContentStream(ByVal sHeader As String) As Boolean
     If InStr(1, sHeader, "/ICCBased",          vbBinaryCompare) > 0 Then Exit Function
     If InStr(1, sHeader, "/Subtype/XML",       vbBinaryCompare) > 0 Then Exit Function
     If InStr(1, sHeader, "/Subtype /XML",      vbBinaryCompare) > 0 Then Exit Function
+    ' /Type/ObjStm: handled by PDF_ExtractObjStmCMaps. Re-processing causes
+    ' garbage output from /Names arrays in XFA/SAP StructTree objects.
+    If InStr(1, sHeader, "/Type/ObjStm",       vbBinaryCompare) > 0 Then Exit Function
+    If InStr(1, sHeader, "/Type /ObjStm",      vbBinaryCompare) > 0 Then Exit Function
+    ' /Type/XRef: compressed cross-reference tables - binary data, never text.
+    If InStr(1, sHeader, "/Type/XRef",         vbBinaryCompare) > 0 Then Exit Function
+    If InStr(1, sHeader, "/Type /XRef",        vbBinaryCompare) > 0 Then Exit Function
     PDF_IsContentStream = True
 End Function
 
@@ -681,8 +668,8 @@ Fail:
 End Function
 
 Private Function PDF_DecodeASCII85(bIn() As Byte) As Byte()
-    ' ASCII85 decode per PDF spec s7.4.3. 5 chars->4 bytes, z=0x00000000, ends at ~>.
-    ' Uses Double arithmetic (group values up to 85^5-1 exceed VBA Long range).
+    ' ASCII85 decoder (PDF spec sec. 7.4.3).
+    ' Uses Double (not Long) - group values reach ~4.44e9, exceeding VBA Long range.
     On Error GoTo Fail
     Dim nIn      As Long
     Dim bOut()   As Byte
@@ -707,7 +694,6 @@ Private Function PDF_DecodeASCII85(bIn() As Byte) As Byte()
     Do While i < nIn
         b = bIn(i)
 
-        ' End-of-data marker ~>
         If b = 126 Then   ' '~'
             If i + 1 < nIn Then
                 If bIn(i + 1) = 62 Then   ' '>'
@@ -718,13 +704,11 @@ Private Function PDF_DecodeASCII85(bIn() As Byte) As Byte()
             GoTo NextByte
         End If
 
-        ' Skip whitespace
         If b = 32 Or b = 9 Or b = 10 Or b = 13 Then
             i = i + 1
             GoTo NextByte
         End If
 
-        ' 'z' shorthand = four zero bytes (only valid at start of a group)
         If b = 122 And nGroup = 0 Then  ' 'z'
             If nOutPos + 4 > nOutSize Then
                 nOutSize = nOutSize + 1024
@@ -737,18 +721,15 @@ Private Function PDF_DecodeASCII85(bIn() As Byte) As Byte()
             GoTo NextByte
         End If
 
-        ' Valid data byte: '!' (33) through 'u' (117)
         If b >= 33 And b <= 117 Then
             grp(nGroup) = b - 33
             nGroup = nGroup + 1
             If nGroup = 5 Then
-                ' Decode 5 chars -> 4 bytes
                 v = CDbl(grp(0)) * 52200625# + _
                     CDbl(grp(1)) *   614125# + _
                     CDbl(grp(2)) *     7225# + _
                     CDbl(grp(3)) *       85# + _
                     CDbl(grp(4))
-                ' Extract 4 bytes, big-endian
                 If nOutPos + 4 > nOutSize Then
                     nOutSize = nOutSize + 4096
                     ReDim Preserve bOut(0 To nOutSize - 1)
@@ -766,9 +747,7 @@ Private Function PDF_DecodeASCII85(bIn() As Byte) As Byte()
 NextByte:
     Loop
 
-    ' Partial final group: nGroup chars -> nGroup-1 bytes
     If nGroup > 1 Then
-        ' Pad to 5 with 84 ('u'-33) per spec
         Dim k As Long
         For k = nGroup To 4
             grp(k) = 84
@@ -801,9 +780,11 @@ Fail:
 End Function
 
 Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean) As Byte()
-    ' LZW decode per PDF spec s7.4.4. MSB-first codes, 256=CLEAR, 257=EOI, 258+=dynamic.
-    ' bEarlyChange=True (PDF default): code width bumps one step early vs. TIFF.
-    ' KwKwK edge case: code == next table slot -> entry is prevString + prevString[0].
+    ' LZW decoder (PDF sec. 7.4.4). MSB-first, 9-12 bit codes.
+    ' EarlyChange=1 (PDF default): code added before width bump.
+    ' EarlyChange=0: standard TIFF late-change (/DecodeParms /EarlyChange 0).
+    ' Table: 0-255 = literals, 256 = CLEAR, 257 = EOI, 258+ = dynamic entries.
+    ' KwKwK edge case: code == next available slot -> entry = prevStr + prevStr[0].
     On Error GoTo Fail
     Const LZW_CLEAR As Long = 256
     Const LZW_EOI   As Long = 257
@@ -815,7 +796,6 @@ Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean)
     Dim lInPos   As Long
     Dim bFail(0) As Byte
 
-    ' Table: parallel arrays of prefix code + suffix byte; strings follow prefix chains.
     Dim tPrefix(LZW_MAXCODES - 1) As Long  ' -1 = literal (no prefix)
     Dim tSuffix(LZW_MAXCODES - 1) As Long
     Dim tLen(LZW_MAXCODES - 1)    As Long  ' cached string length
@@ -850,7 +830,6 @@ Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean)
     lBitCnt = 0
 
     Do
-        ' Read codeSize bits, MSB-first
         Dim lCode As Long: lCode = 0
         Dim bitsLeft As Long: bitsLeft = codeSize
         Do While bitsLeft > 0
@@ -869,15 +848,12 @@ Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean)
 
         If code = LZW_EOI Then Exit Do
         If code = LZW_CLEAR Then
-            ' Reset table and code width
             codeSize = 9
             nextCode = LZW_FIRST
             prevCode = -1
         Else
-            ' Determine string for this code
             Dim firstByte As Long
             If code < nextCode And tLen(code) > 0 Then
-                ' Known code: follow prefix chain to build string on stack
                 stackLen = 0
                 Dim chainCode As Long: chainCode = code
                 Do While chainCode >= 0
@@ -902,7 +878,6 @@ Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean)
                 GoTo Fail  ' corrupt stream
             End If
 
-            ' Output string (stack is reversed)
             If lOutPos + stackLen > lOutSize Then
                 lOutSize = lOutPos + stackLen + 65536
                 ReDim Preserve bOut(0 To lOutSize - 1)
@@ -912,14 +887,12 @@ Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean)
                 lOutPos = lOutPos + 1
             Next j
 
-            ' Add new table entry: prevCode + firstByte of this string
             If prevCode >= 0 And nextCode < LZW_MAXCODES Then
                 tPrefix(nextCode) = prevCode
                 tSuffix(nextCode) = firstByte
                 tLen(nextCode)    = tLen(prevCode) + 1
                 nextCode = nextCode + 1
 
-                ' Bump code width at the right moment
                 If bEarlyChange Then
                     ' PDF default: bump when table fills INCLUDING the slot just added
                     If nextCode = (1 << codeSize) And codeSize < 12 Then
@@ -950,7 +923,7 @@ Fail:
 End Function
 
 Private Function PDF_DecodeASCIIHex(bIn() As Byte) As Byte()
-    ' ASCIIHexDecode per PDF spec s7.4.2: hex pairs, whitespace ignored, terminated by ">".
+    ' ASCIIHexDecode decoder (PDF sec. 7.4.2). Hex pairs -> bytes, '>' terminates.
     On Error GoTo Fail
     Dim bFail(0) As Byte
     Dim nIn      As Long: nIn = UBound(bIn) + 1
@@ -967,7 +940,6 @@ Private Function PDF_DecodeASCIIHex(bIn() As Byte) As Byte()
     For i = 0 To nIn - 1
         c = bIn(i)
         If c = 62 Then Exit For   ' '>' end marker
-        ' Convert hex digit to nibble value
         If c >= 48 And c <= 57 Then       ' '0'-'9'
             nibble = c - 48
         ElseIf c >= 65 And c <= 70 Then   ' 'A'-'F'
@@ -1007,8 +979,7 @@ Fail:
 End Function
 
 Private Function PDF_DecodeRunLength(bIn() As Byte) As Byte()
-    ' RunLengthDecode (PackBits) per PDF spec s7.4.5.
-    ' 0-127: copy next (len+1) bytes. 129-255: repeat next byte (257-len) times. 128=EOD.
+    ' RunLengthDecode decoder (PDF sec. 7.4.5, PackBits).
     On Error GoTo Fail
     Dim bFail(0) As Byte
     Dim nIn      As Long: nIn = UBound(bIn) + 1
@@ -1028,7 +999,6 @@ Private Function PDF_DecodeRunLength(bIn() As Byte) As Byte()
         If length = 128 Then Exit Do  ' EOD
 
         If length < 128 Then
-            ' Literal run: copy next (length + 1) bytes
             n = length + 1
             If lOutPos + n > lOutSize Then
                 lOutSize = lOutPos + n + 16384
@@ -1039,7 +1009,6 @@ Private Function PDF_DecodeRunLength(bIn() As Byte) As Byte()
                 bOut(lOutPos) = bIn(i): lOutPos = lOutPos + 1: i = i + 1
             Next j
         Else
-            ' Repeat run: copy next byte (257 - length) times
             n = 257 - length
             If i > UBound(bIn) Then GoTo EmitRL
             Dim repByte As Byte: repByte = bIn(i): i = i + 1
@@ -1147,7 +1116,7 @@ Private Function VBA_Inflate(bIn() As Byte, ByVal lSkip As Long) As Byte()
     DIST_EXTRA(28)=13: DIST_BASE(28)=16385
     DIST_EXTRA(29)=13: DIST_BASE(29)=24577
 
-    ' Code-length alphabet reorder (RFC 1951 s3.2.7)
+    ' Code-length alphabet reorder (RFC 1951 sec. 3.2.7)
     Dim CL_ORDER(18) As Long
     CL_ORDER(0)=16: CL_ORDER(1)=17: CL_ORDER(2)=18: CL_ORDER(3)=0
     CL_ORDER(4)=8:  CL_ORDER(5)=7:  CL_ORDER(6)=9:  CL_ORDER(7)=6
@@ -1186,7 +1155,7 @@ Private Function VBA_Inflate(bIn() As Byte, ByVal lSkip As Long) As Byte()
     Dim blkLen   As Long
     Dim distSym  As Long
 
-    ' Fixed Huffman code lengths (RFC 1951 §3.2.6)
+    ' Fixed Huffman code lengths (RFC 1951 sec. 3.2.6)
     Dim fixLL(287) As Long
     For i = 0 To 143:   fixLL(i) = 8: Next i
     For i = 144 To 255: fixLL(i) = 9: Next i
@@ -1215,7 +1184,6 @@ Private Function VBA_Inflate(bIn() As Byte, ByVal lSkip As Long) As Byte()
             lBitBuf = 0: lBitCnt = 0  ' byte-align
             blkLen = bIn(lInPos) + bIn(lInPos + 1) * 256
             lInPos = lInPos + 4  ' skip LEN + NLEN
-            ' grow output if needed
             If lOutPos + blkLen > lOutSize Then
                 lOutSize = lOutPos + blkLen + 65536
                 ReDim Preserve bOut(0 To lOutSize - 1)
@@ -1653,9 +1621,7 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
             i = i + 1: GoTo NextChar
 
         Case Chr(34)  ' " operator: aw ac string " = set word/char spacing, move to next line, show string
-            ' Syntax: aw ac string "  where aw/ac are already in the numeric token buffer (sTok).
-            ' We ignore aw/ac (word/char spacing) - they affect visual layout but not text content.
-            ' Behaviour is otherwise identical to the ' operator: advance Y and show the top token.
+            ' aw/ac (word/char spacing) are in sTok - ignored for extraction.
             If tCount > 0 Then
                 curY = curY - curLead
                 If Len(sCMap) > 0 And tokIsHex(tCount - 1) Then
@@ -1712,7 +1678,7 @@ Private Function PDF_HexDecode(ByVal sHex As String) As String
     If Len(sHex) Mod 2 = 1 Then sHex = sHex & "0"
 
     If Len(sHex) >= 4 Then
-        If Left$(sHex, 4) = "FEFF" Then  ' UTF-16 BOM - decode as 2-byte codepoints
+        If Left$(sHex, 4) = "FEFF" Then  ' UTF-16 BOM  - decode as 2-byte codepoints
             For i = 5 To Len(sHex) - 3 Step 4
                 cp = Val("&H" & Mid$(sHex, i, 2)) * 256 + Val("&H" & Mid$(sHex, i + 2, 2))
                 If cp > 0 Then result = result & ChrW(cp)
@@ -1724,7 +1690,7 @@ Private Function PDF_HexDecode(ByVal sHex As String) As String
 
     For i = 1 To Len(sHex) - 1 Step 2
         b = Val("&H" & Mid$(sHex, i, 2))
-        result = result & Chr(b)  ' preserve nulls - 2-byte CID pairs need both bytes
+        result = result & Chr(b)  ' preserve nulls  - 2-byte CID pairs need both bytes
     Next i
     PDF_HexDecode = result
 End Function
@@ -1825,7 +1791,7 @@ Private Function PDF_ParseCMap(ByVal sCMap As String) As String
 End Function
 
 Private Function PDF_ApplyCMap(ByVal sCMapData As String, ByVal sRaw As String) As String
-    ' Auto-detects 1-byte vs 2-byte CID mode (any src code > 255 -> 2-byte).
+    ' Auto-detects 1-byte vs 2-byte CID mode.
     Dim result  As String
     Dim i       As Long
     Dim cid     As Long
@@ -1895,7 +1861,7 @@ Private Function PDF_ApplyCMap(ByVal sCMapData As String, ByVal sRaw As String) 
 End Function
 
 Private Function PDF_SortAndJoin(ByVal sRuns As String) As String
-    ' Y_TOL: runs within 8 points of each other are on the same line (stored *100)
+    ' Y_TOL: runs within 8 pts are on the same line (coords stored *100).
     Const Y_TOL   As Long = 800
     Dim runs()    As String
     Dim n         As Long
@@ -1945,8 +1911,7 @@ NextRun:
     n = idx
     If n = 0 Then PDF_SortAndJoin = "": Exit Function
 
-    ' Y>20000 (>200 pts scaled *100) = standard PDF coords (origin bottom-left, descending sort).
-    ' Y<=20000 = flipped CTM (origin top-left, ascending sort).
+    ' Y>20000 = standard PDF (bottom-left origin, desc. sort). Y<=20000 = flipped CTM (asc. sort).
     maxY = 0
     For i = 0 To n - 1
         If arrY(i) > maxY Then maxY = arrY(i)
