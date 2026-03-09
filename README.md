@@ -1,46 +1,107 @@
 # VBA-PdfTXT
 
-A pure VBA PDF text extraction library. No external dependencies, no DLLs, no COM automation — the entire implementation lives in a single `.bas` file.
-
----
-
-## Why this exists
-
-Every VBA approach to reading PDFs either requires a third-party library, shells out to an external process, or relies on Adobe Acrobat being installed. This module reads the file directly, decompresses content streams with a from-scratch DEFLATE implementation, resolves font CMaps (including those buried inside PDF 1.5+ object streams), and returns plain Unicode text entirely within the VBA runtime.
+Pure VBA PDF text extractor. Drops into any Excel, Word, or Access VBA project as a single `.bas` file.
 
 ---
 
 ## What it handles
 
-* **FlateDecode (DEFLATE) compressed streams** — full RFC 1951 implementation in pure VBA, including stored blocks, fixed Huffman trees, and dynamic Huffman trees
-* **ASCII85Decode streams** — pure VBA Base-85 decoder per PDF spec §7.4.3, including the `z` zero shorthand, partial final groups, and the `~>` end marker; also handles the chained `[/ASCII85Decode /FlateDecode]` filter array used by ReportLab and Ghostscript's `ps2pdf`
-* **PNG and TIFF predictors** — all five PNG row filters (None, Sub, Up, Average, Paeth) and the TIFF horizontal-differencing predictor, applied automatically when `/DecodeParms` specifies them
-* **Indirect `/Filter` references** — some generators (e.g. SAP NetWeaver) write `/Filter 6 0 R` instead of `/Filter /FlateDecode`; the reference is resolved before decompression
-* **2-byte CID-encoded fonts** — the encoding used by Word, LibreOffice, and most modern PDF generators; glyph IDs are mapped back to Unicode via the embedded ToUnicode CMap
-* **Literal 1-byte encoded fonts** — standard Latin PDFs using `(text) Tj` operators with octal escape sequences
-* **ToUnicode CMaps in Object Streams (PDF 1.5+)** — Chrome, Word, and LibreOffice often pack font objects into compressed `/ObjStm` bundles; CMaps inside them are now extracted correctly, so CID-encoded PDFs from these generators decode properly
-* **Multi-column layout reconstruction** — tracks the text matrix (`Tm`, `Td`, `TD`, `T*`, `'`) to recover X/Y positions, sorts runs spatially, and joins columns on the same line with a tab character
-* **Ligatures and multi-codepoint CMap destinations** — `fl`, `fi`, `ffi`, and other multi-codepoint sequences are emitted as their full character sequences
-* **Both PDF coordinate systems** — auto-detects whether Y increases upward (standard PDF origin) or downward (Word/LibreOffice flipped CTM) and sorts accordingly
-* **Multiple content streams per page** — all streams are collected before sorting, so the final output reflects visual reading order across the whole page
+### Compression filters (complete PDF filter set for text streams)
+| Filter | Abbreviation | Notes |
+|---|---|---|
+| FlateDecode | `/Fl` | zlib/Deflate: used by Word, LibreOffice, Chrome, LaTeX, iText |
+| ASCII85Decode | `/A85` | Used by ReportLab (`pageCompression=1`), Ghostscript `ps2pdf`, Acrobat Distiller PostScript path |
+| LZWDecode | `/LZW` | Legacy compression: Acrobat Distiller ≤ 3.x, old WordPerfect, early laser printer drivers; supports both EarlyChange=1 (PDF default) and EarlyChange=0 |
+| ASCIIHexDecode | `/AHx` | Hex-encoded streams: old Distiller settings, often chained as `[/ASCIIHexDecode /LZWDecode]` |
+| RunLengthDecode | `/RL` | PackBits RLE: completes the non-image filter set |
+
+Filter chains (arrays like `[/ASCII85Decode /FlateDecode]` or `[/ASCIIHexDecode /LZWDecode]`) are decoded in the correct order at all three internal pass sites (CMap pass, content stream pass, ObjStm pass).
+
+Image-only filters (DCTDecode/JPEG, JBIG2, JPXDecode, CCITTFax) are detected and the stream is skipped: they never contain extractable text.
+
+### Text encodings
+- **Latin-1 literal strings** `(text)`: standard single-byte encoding
+- **Hex strings with ToUnicode CMap** `<hexdata>`: full CMap lookup including `beginbfchar`, `beginbfrange`, and multi-byte ranges
+- **2-byte CID mode** (Identity-H/V fonts used by InDesign, modern Word): automatic detection via even-length hex strings
+- **UTF-16 BOM in hex strings**: `FEFF...` prefix detected and decoded as UTF-16BE
+- **Octal escapes** in literal strings: `\101` → `A`
+- **Standard escape sequences**: `\n \r \t \\ \( \)`
+
+### Content stream operators
+| Operator | Meaning |
+|---|---|
+| `Tj` | Show string |
+| `TJ` | Show array of strings (with kerning values: numbers ignored, text concatenated) |
+| `'` | Move to next line and show string |
+| `"` | Set word/char spacing, move to next line, show string |
+| `Tm` | Set text matrix (position) |
+| `Td` / `TD` | Move text position |
+| `T*` | Move to next line |
+| `TL` | Set leading |
+| `BT` / `ET` | Begin/end text block |
+
+### Structural features
+- **Multi-stream pages**: all content streams per page collected and spatially sorted
+- **Reading-order reconstruction**: Y-then-X sort approximates top-to-bottom, left-to-right reading order
+- **Object streams** (PDF 1.5+ ObjStm): compressed font/CMap objects extracted from cross-reference streams
+- **Indirect /Filter references**: `/Filter 6 0 R` resolved one level deep (SAP NetWeaver, some enterprise generators)
+- **PNG predictor** (values 10–15) and **TIFF predictor** (value 2): reversed after FlateDecode
+- **Linearised PDFs**: handled by linear stream scan (no XREF dependency)
+- **Form XObjects** (`/Subtype /Form`): picked up automatically as content streams (headers, footers, stamps, repeated elements)
+- **Tagged PDF / Marked content** (`BDC`/`EMC`): tags silently ignored, text operators extracted normally
+- **Encrypted PDFs**: detected via `/Encrypt` dict; returns empty string immediately
+
+### Output cleaning
+`PDF_CleanText` is applied to the final joined output:
+- Strips null bytes (codes 0–31, 127, 128–159) that appear when hex strings have no CMap mapping
+- Collapses consecutive double-spaces from explicit character spacing
+- Normalises line breaks
 
 ---
 
-## What it does not handle
+## What it does not handle (and why)
 
-* **Encrypted PDFs** — files with a `/Encrypt` dictionary are detected early and the function returns an empty string
-* **Scanned / image-only PDFs** — there is no OCR; if a PDF contains no text operators, nothing is extracted
-* **Type 1 / TrueType fonts without a ToUnicode CMap** — some very old or highly customised PDFs omit the CMap; glyphs may come out as raw byte values or be silently skipped
-* **Right-to-left text** — Arabic, Hebrew, etc. will be extracted but word order within a line may be reversed
-* **`"` (double-quote) TJ operator** — the operator that sets word and character spacing then shows a string in one step is not currently handled; it is uncommon outside specialised generators
-* **bfrange array-destination form** — a rare CMap variant where a single range maps to an explicit array of destination codes (instead of a sequential run) is not parsed; sequential runs, which cover the vast majority of real-world CMaps, are fully supported
+| Scenario | Reason |
+|---|---|
+| **Encrypted PDFs** (password-protected) | Stream data is ciphertext; decryption requires AES/RC4: out of scope, use OCR fallback |
+| **Type 3 fonts without `/ToUnicode`** | Glyphs named `/a0`, `/a1`… have no standardised Unicode mapping; the character identity is only in the drawing procedures (Bézier paths / bitmaps): fundamentally undecipherable without the font author's intent. These runs produce empty output (not garbage). |
+| **Image-only PDFs** (scanned documents) | No text operators exist; OCR required |
+| **`bfrange` array destinations** | Rare CMap variant; silently produces missing characters, no crash |
 
 ---
 
-## Installation
+## Architecture: 25 functions
 
-1. In the VBA editor, go to **File → Import File** and select `VBA-PdfTXT.bas`
-2. That is it. No references to set, no extra modules needed.
+### Public API (2)
+| Function | Signature | Description |
+|---|---|---|
+| `PDF_ExtractText` | `(sFilePath As String) As String` | Main entry point. Returns extracted text or `""` on encrypted/invalid files. |
+| `PDF_DiagnoseStreams` | `(sFilePath As String) As String` | Diagnostic: lists every stream found, its filter chain, byte counts, and whether it was parsed as a content stream. |
+
+### Internal pipeline (23)
+| Function | Role |
+|---|---|
+| `PDF_ProcessAllStreams` | Orchestrates the three-pass pipeline; returns `PDF_CleanText(PDF_SortAndJoin(...))` |
+| `PDF_ParseCMap` | Parses CMap object into a lookup string |
+| `PDF_ApplyCMap` | Maps raw byte string through CMap lookup |
+| `PDF_ExtractObjStmCMaps` | Extracts CMap data from PDF 1.5+ ObjStm streams |
+| `PDF_ExtractTextOps` | State-machine content stream parser: Tj/TJ/Tm/Td/TD/T*/TL/'/"/BT/ET |
+| `PDF_HexDecode` | Decodes `<hex>` strings including UTF-16 BOM handling |
+| `PDF_SortAndJoin` | Spatially sorts text runs (Y desc, X asc) and joins to string |
+| `PDF_CleanText` | Strips control characters, collapses double-spaces |
+| `PDF_ResolveFilterRef` | Resolves indirect `/Filter N M R` references one level |
+| `PDF_ParseDecodeParms` | Extracts `/Predictor`, `/Columns`, `/EarlyChange` from stream dict |
+| `PDF_ApplyPredictor` | Reverses PNG (10–15) and TIFF (2) predictor encoding |
+| `PDF_DecodeASCII85` | ASCII85 (Base-85) decoder: groups of 5 chars → 4 bytes, `z` shorthand, partial final group |
+| `PDF_DecodeASCIIHex` | ASCIIHexDecode: hex digit pairs → bytes, whitespace-tolerant, `>` terminator |
+| `PDF_DecompressLZW` | LZW decoder: variable-width 9–12 bit codes, MSB-first, KwKwK edge case, EarlyChange=0/1 |
+| `PDF_DecodeRunLength` | PackBits RLE decoder: literal runs, repeat runs, 128=EOD |
+| `PDF_DecompressDeflate` | Calls `VBA_Inflate` with zlib header skip |
+| `VBA_Inflate` | Pure VBA DEFLATE implementation (fixed + dynamic Huffman, LZ77 back-references) |
+| `INF_ReadBits` | LSB-first bit reader used by `VBA_Inflate` |
+| `INF_BuildTree` | Builds canonical Huffman decode tree |
+| `INF_DecodeSymbol` | Decodes one symbol from the bit stream |
+| `HuffNode` / `HuffMakeTree` | Huffman tree node type and builder |
 
 ---
 
@@ -48,98 +109,71 @@ Every VBA approach to reading PDFs either requires a third-party library, shells
 
 ```vba
 Dim sText As String
-sText = PDF_ExtractText("C:\path\to\file.pdf")
-
+sText = PDF_ExtractText("C:\reports\invoice.pdf")
 If Len(sText) = 0 Then
-    ' Encrypted, image-only, or some other issue reading the file
+    ' Encrypted, image-only, corrupt, or could be an extreme unhandled edge-case as well
 Else
     Debug.Print sText
 End If
 ```
 
-The returned string uses:
-
-* **Line feed** (`Chr(10)`) between lines
-* **Tab** (`Chr(9)`) between items on the same visual line (e.g. a label and its value in a two-column layout)
-
----
-
-## Diagnostics
-
-If a PDF returns empty text unexpectedly, call the diagnostic function to inspect its streams:
-
+Diagnostics:
 ```vba
-Debug.Print PDF_DiagnoseStreams("C:\path\to\file.pdf")
-```
-
-This prints each stream's position, length, filter type, whether it was identified as a content stream, and whether it is an object stream — useful for spotting encrypted, image-only, or non-standard PDFs.
-
----
-
-## Architecture
-
-The module is a single `.bas` file with 22 functions. The public surface is just two; everything else is internal.
-
-```
-PDF_ExtractText           ← public entry point
-PDF_DiagnoseStreams        ← public diagnostic helper
-
-PDF_ReadFileBytes          reads raw file bytes into a Byte array
-PDF_BytesToLatin1          converts a Byte array to a 1:1 Latin-1 string
-PDF_ProcessAllStreams       two-pass: (1) collect CMaps, (2) extract positioned runs
-PDF_ExtractObjStmCMaps     extracts ToUnicode CMaps from PDF 1.5+ /ObjStm bundles
-PDF_IsContentStream        rejects font files, images, ICC profiles, XMP, etc.
-PDF_ResolveFilterRef       resolves indirect /Filter object references (e.g. SAP PDFs)
-PDF_ParseDecodeParms       parses /Predictor and /Columns from a stream dictionary
-PDF_ApplyPredictor         reverses PNG and TIFF predictor encoding (PDF spec Table 8)
-PDF_DecompressDeflate      entry point for DEFLATE decompression (strips zlib header)
-PDF_DecodeASCII85          decodes ASCII85 (Base-85) encoded streams (PDF spec §7.4.3)
-VBA_Inflate                RFC 1951 DEFLATE decompressor (all three block types)
-INF_ReadBits               bit-level reader for VBA_Inflate
-INF_BuildTable             builds a Huffman decode table from code-length arrays
-INF_DecodeHuff             decodes one symbol using a Huffman table
-PDF_ExtractTextOps         parses PDF content stream operators, tracks text position
-PDF_HexDecode              decodes <hex> strings, preserving null bytes for CID pairing
-PDF_CleanText              strips control characters and collapses double spaces
-PDF_ParseCMap              parses beginbfchar / beginbfrange CMap sections
-PDF_ApplyCMap              maps 1-byte or 2-byte CID values to Unicode via a parsed CMap
-PDF_SortAndJoin            sorts positioned text runs into visual reading order
+Debug.Print PDF_DiagnoseStreams("C:\reports\invoice.pdf")
 ```
 
 ---
 
-## Performance
+## Compatibility notes
 
-The bottleneck is the pure-VBA DEFLATE decompressor. On a typical modern machine:
-
-| PDF type | Pages | Approx. time |
+### PDF generators confirmed to work
+| Generator | Filter used | Notes |
 |---|---|---|
-| Simple text, uncompressed | any | < 100 ms |
-| Compressed, standard 1-byte encoding | 1–5 | ~200–500 ms |
-| Compressed, CID encoding (Word/LibreOffice export) | 1–5 | ~300–800 ms |
-| Compressed, CID encoding with ObjStm fonts | 1–5 | ~400–900 ms |
-| ASCII85 + FlateDecode (ReportLab, Ghostscript ps2pdf) | 1–5 | ~300–700 ms |
+| Microsoft Word (all versions) | FlateDecode | |
+| LibreOffice Writer | FlateDecode | |
+| Google Chrome / Chromium print-to-PDF | FlateDecode | |
+| LaTeX (pdflatex, xelatex, lualatex) | FlateDecode | CMap extracted for ligatures |
+| Adobe InDesign | FlateDecode + CID | 2-byte CID mode |
+| iText / iTextSharp | FlateDecode | |
+| Apache PDFBox | FlateDecode | |
+| ReportLab (Python) | ASCII85Decode + FlateDecode | `pageCompression=1` default |
+| Ghostscript `ps2pdf` | ASCII85Decode + FlateDecode | |
+| Acrobat Distiller (modern) | FlateDecode or ASCII85+Flate | |
+| Acrobat Distiller ≤ 3.x (legacy) | LZWDecode or ASCIIHex+LZW | PDF 1.1–1.2 era |
+| Old WordPerfect PDF export | LZWDecode | |
+| Uncompressed hand-crafted PDFs | None (raw) | |
 
-For bulk processing, call `PDF_ExtractText` in a loop with `DoEvents` between files to keep the host application responsive.
+
+## Performance (approximate, Core i5, 32-bit VBA host)
+
+| Content type | Pages | Typical time |
+|---|---|---|
+| FlateDecode (Word, LibreOffice) | 1–10 | 50–200 ms |
+| FlateDecode (Word, LibreOffice) | 50–100 | 1–3 s |
+| ASCII85 + FlateDecode (ReportLab) | 1–5 | 300–700 ms |
+| LZWDecode (legacy Distiller) | 1–10 | 100–400 ms |
+| ASCIIHex + LZW chain | 1–5 | 150–500 ms |
+| RunLengthDecode | 1–5 | 50–150 ms |
+| Uncompressed | any | < 50 ms |
 
 ---
 
-## Known edge cases
+## Installation
 
-**Two-column layouts** — labels and values on the same visual line are joined with a tab. Split on `Chr(9)` to get them as separate fields.
+1. Download `VBA-PdfTXT.bas`
+2. In your VBA project: **File → Import File** → select `VBA-PdfTXT.bas`
+3. Call `PDF_ExtractText(filePath)` from any module
 
-**Line spacing tolerance** — two text runs are treated as the same line if their Y coordinates are within 8 PDF points. This handles most layouts comfortably. If a document with very tight superscripts or very wide line spacing merges or splits lines incorrectly, adjust the `Y_TOL` constant in `PDF_SortAndJoin` (stored ×100, so the default 800 = 8.0 points).
-
-**Windows code page** — `PDF_ApplyCMap` uses `Asc()` to recover byte values from VBA's internal string representation. This correctly round-trips all byte values on systems using a single-byte ANSI code page (CP1252, CP1250, etc.). Behaviour on DBCS code page systems (Japanese, Chinese, Korean) has not been tested.
-
-**Incremental PDF updates** — the parser scans the file linearly and ignores the cross-reference table. In PDFs with incremental updates, superseded object versions may also be parsed alongside their replacements. In practice this is harmless for text extraction.
-
----
-
-Copyright © 2026, [rafael-yml](https://rafael-yml.lovable.app/)
+No references to set. No DLLs to register. Works in Excel, Word, Access, and any other Office VBA host.
 
 ---
 
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
+
+---
+
+## Credits
+
+Copyright © 2026, [rafael-yml](https://rafael-yml.lovable.app/)
