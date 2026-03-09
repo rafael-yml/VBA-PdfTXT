@@ -1,4 +1,4 @@
-Attribute VB_Name = "VBA-PdfTXT"
+Attribute VB_Name = "VBA-PdfTXT (Old working file)"
 Option Explicit
 
 Public Function PDF_ExtractText(ByVal sFilePath As String) As String
@@ -110,17 +110,24 @@ Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As Strin
             For lCMBI = 0 To lCME - lCMS - 1
                 bCMRaw(lCMBI) = bFile(lCMS - 1 + lCMBI)
             Next lCMBI
-            If bCMRaw(0) = &H78 Then
-                bCMDec = PDF_DecompressDeflate(bCMRaw)
-                Dim nPredCM As Long, nColsCM As Long
-                Dim sCMHdr  As String
-                Dim lCMHS   As Long
-                lCMHS  = IIf(lCMPos - 512 < 1, 1, lCMPos - 512)
-                sCMHdr = Mid$(sRaw, lCMHS, lCMPos - lCMHS)
-                PDF_ParseDecodeParms sCMHdr, nPredCM, nColsCM
-                If nPredCM >= 2 Then bCMDec = PDF_ApplyPredictor(bCMDec, nPredCM, nColsCM)
+            Dim nPredCM As Long, nColsCM As Long
+            Dim sCMHdr  As String
+            Dim lCMHS   As Long
+            lCMHS  = IIf(lCMPos - 512 < 1, 1, lCMPos - 512)
+            sCMHdr = Mid$(sRaw, lCMHS, lCMPos - lCMHS)
+            If InStr(1, sCMHdr, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
+               InStr(1, sCMHdr, "/A85",           vbBinaryCompare) > 0 Then
+                bCMDec = PDF_DecodeASCII85(bCMRaw)
             Else
                 bCMDec = bCMRaw
+            End If
+            If InStr(1, sCMHdr, "/FlateDecode", vbBinaryCompare) > 0 Or _
+               InStr(1, sCMHdr, "/Fl ",         vbBinaryCompare) > 0 Or _
+               InStr(1, sCMHdr, "/Fl>",         vbBinaryCompare) > 0 Or _
+               InStr(1, sCMHdr, "/Fl/",         vbBinaryCompare) > 0 Then
+                bCMDec = PDF_DecompressDeflate(bCMDec)
+                PDF_ParseDecodeParms sCMHdr, nPredCM, nColsCM
+                If nPredCM >= 2 Then bCMDec = PDF_ApplyPredictor(bCMDec, nPredCM, nColsCM)
             End If
             If UBound(bCMDec) > 10 Then
                 sCMText = PDF_BytesToLatin1(bCMDec)
@@ -199,6 +206,10 @@ SkipCM:
                     Dim nPred1 As Long, nCols1 As Long
                     Dim sHdrR1 As String
                     sHdrR1 = PDF_ResolveFilterRef(sHeader, sRaw)
+                    If InStr(1, sHdrR1, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
+                       InStr(1, sHdrR1, "/A85",           vbBinaryCompare) > 0 Then
+                        bStream = PDF_DecodeASCII85(bStream)
+                    End If
                     If InStr(1, sHdrR1, "/FlateDecode", vbBinaryCompare) > 0 Or _
                        InStr(1, sHdrR1, "/Fl ",         vbBinaryCompare) > 0 Or _
                        InStr(1, sHdrR1, "/Fl>",         vbBinaryCompare) > 0 Or _
@@ -222,7 +233,7 @@ SkipCM:
         End If
     Loop
 
-    PDF_ProcessAllStreams = PDF_SortAndJoin(sAllRuns)
+    PDF_ProcessAllStreams = PDF_CleanText(PDF_SortAndJoin(sAllRuns))
 End Function
 
 Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As String
@@ -330,15 +341,19 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
             Dim nPredOS As Long, nColsOS As Long
             Dim sHdrR2 As String
             sHdrR2 = PDF_ResolveFilterRef(sHeader, sRaw)
+            If InStr(1, sHdrR2, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
+               InStr(1, sHdrR2, "/A85",           vbBinaryCompare) > 0 Then
+                bDec = PDF_DecodeASCII85(bRaw)
+            Else
+                bDec = bRaw
+            End If
             If InStr(1, sHdrR2, "/FlateDecode", vbBinaryCompare) > 0 Or _
                InStr(1, sHdrR2, "/Fl ",         vbBinaryCompare) > 0 Or _
                InStr(1, sHdrR2, "/Fl>",         vbBinaryCompare) > 0 Or _
                InStr(1, sHdrR2, "/Fl/",         vbBinaryCompare) > 0 Then
-                bDec = PDF_DecompressDeflate(bRaw)
+                bDec = PDF_DecompressDeflate(bDec)
                 PDF_ParseDecodeParms sHeader, nPredOS, nColsOS
                 If nPredOS >= 2 Then bDec = PDF_ApplyPredictor(bDec, nPredOS, nColsOS)
-            Else
-                bDec = bRaw  ' uncompressed ObjStm (rare but legal)
             End If
 
             If UBound(bDec) > lFirst Then
@@ -619,6 +634,131 @@ Private Function PDF_DecompressDeflate(bIn() As Byte) As Byte()
     Exit Function
 Fail:
     PDF_DecompressDeflate = bEmpty
+End Function
+
+Private Function PDF_DecodeASCII85(bIn() As Byte) As Byte()
+    ' Decodes an ASCII85 (Base-85) encoded byte stream per PDF spec §7.4.3.
+    ' Groups of 5 printable chars (ASCII 33–117, i.e. '!' to 'u') encode 4 bytes.
+    ' 'z' alone encodes four zero bytes.  Stream ends at ~>.
+    ' Partial final group: n chars encode n-1 bytes.
+    ' Arithmetic uses Double to safely hold group values up to 85^5-1 ≈ 4.44e9,
+    ' which exceeds the VBA Long range (2^31-1) but is well within Double precision
+    ' (53-bit mantissa, exact for integers up to 2^53 ≈ 9.0e15).
+    On Error GoTo Fail
+    Dim nIn      As Long
+    Dim bOut()   As Byte
+    Dim nOutSize As Long
+    Dim nOutPos  As Long
+    Dim i        As Long
+    Dim b        As Long
+    Dim nGroup   As Long
+    Dim grp(4)   As Long   ' up to 5 digits per group
+    Dim v        As Double
+    Dim bFail(0) As Byte
+
+    nIn = UBound(bIn) + 1
+    If nIn = 0 Then PDF_DecodeASCII85 = bFail: Exit Function
+
+    nOutSize = (nIn \ 5 + 1) * 4 + 16
+    ReDim bOut(0 To nOutSize - 1)
+    nOutPos = 0
+    nGroup  = 0
+    i = 0
+
+    Do While i < nIn
+        b = bIn(i)
+
+        ' End-of-data marker ~>
+        If b = 126 Then   ' '~'
+            If i + 1 < nIn Then
+                If bIn(i + 1) = 62 Then   ' '>'
+                    Exit Do
+                End If
+            End If
+            i = i + 1
+            GoTo NextByte
+        End If
+
+        ' Skip whitespace
+        If b = 32 Or b = 9 Or b = 10 Or b = 13 Then
+            i = i + 1
+            GoTo NextByte
+        End If
+
+        ' 'z' shorthand = four zero bytes (only valid at start of a group)
+        If b = 122 And nGroup = 0 Then  ' 'z'
+            If nOutPos + 4 > nOutSize Then
+                nOutSize = nOutSize + 1024
+                ReDim Preserve bOut(0 To nOutSize - 1)
+            End If
+            bOut(nOutPos) = 0: bOut(nOutPos + 1) = 0
+            bOut(nOutPos + 2) = 0: bOut(nOutPos + 3) = 0
+            nOutPos = nOutPos + 4
+            i = i + 1
+            GoTo NextByte
+        End If
+
+        ' Valid data byte: '!' (33) through 'u' (117)
+        If b >= 33 And b <= 117 Then
+            grp(nGroup) = b - 33
+            nGroup = nGroup + 1
+            If nGroup = 5 Then
+                ' Decode 5 chars -> 4 bytes
+                v = CDbl(grp(0)) * 52200625# + _
+                    CDbl(grp(1)) *   614125# + _
+                    CDbl(grp(2)) *     7225# + _
+                    CDbl(grp(3)) *       85# + _
+                    CDbl(grp(4))
+                ' Extract 4 bytes, big-endian
+                If nOutPos + 4 > nOutSize Then
+                    nOutSize = nOutSize + 4096
+                    ReDim Preserve bOut(0 To nOutSize - 1)
+                End If
+                bOut(nOutPos)     = CByte(Int(v / 16777216#) And 255)
+                bOut(nOutPos + 1) = CByte(Int(v / 65536#)    And 255)
+                bOut(nOutPos + 2) = CByte(Int(v / 256#)      And 255)
+                bOut(nOutPos + 3) = CByte(v                  And 255)
+                nOutPos = nOutPos + 4
+                nGroup = 0
+            End If
+        End If
+
+        i = i + 1
+NextByte:
+    Loop
+
+    ' Handle partial final group (nGroup chars -> nGroup-1 bytes)
+    If nGroup > 1 Then
+        ' Pad to 5 with 84 ('u'-33) per spec
+        Dim k As Long
+        For k = nGroup To 4
+            grp(k) = 84
+        Next k
+        v = CDbl(grp(0)) * 52200625# + _
+            CDbl(grp(1)) *   614125# + _
+            CDbl(grp(2)) *     7225# + _
+            CDbl(grp(3)) *       85# + _
+            CDbl(grp(4))
+        Dim nBytes As Long: nBytes = nGroup - 1
+        If nOutPos + nBytes > nOutSize Then
+            nOutSize = nOutPos + nBytes + 16
+            ReDim Preserve bOut(0 To nOutSize - 1)
+        End If
+        If nBytes >= 1 Then bOut(nOutPos)     = CByte(Int(v / 16777216#) And 255)
+        If nBytes >= 2 Then bOut(nOutPos + 1) = CByte(Int(v / 65536#)    And 255)
+        If nBytes >= 3 Then bOut(nOutPos + 2) = CByte(Int(v / 256#)      And 255)
+        nOutPos = nOutPos + nBytes
+    End If
+
+    If nOutPos = 0 Then
+        PDF_DecodeASCII85 = bFail
+    Else
+        ReDim Preserve bOut(0 To nOutPos - 1)
+        PDF_DecodeASCII85 = bOut
+    End If
+    Exit Function
+Fail:
+    PDF_DecodeASCII85 = bFail
 End Function
 
 Private Function VBA_Inflate(bIn() As Byte, ByVal lSkip As Long) As Byte()
