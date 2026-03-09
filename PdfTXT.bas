@@ -1,4 +1,4 @@
-Attribute VB_Name = "VBA-PdfTXT"
+Attribute VB_Name = "PdfTXT"
 Option Explicit
 
 Public Function PDF_ExtractText(ByVal sFilePath As String) As String
