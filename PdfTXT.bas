@@ -47,7 +47,7 @@ Private Function PDF_BytesToLatin1(bData() As Byte) As String
 End Function
 
 Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As String
-    ' old amounts are a theoretical risk.
+    ' old amounts are a theoretical risk but unlikely in remittance docs.
     Dim lPos         As Long
     Dim lStart       As Long
     Dim lEnd         As Long
@@ -74,6 +74,15 @@ Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As Strin
     Dim sCMText   As String
     Dim sAllRuns  As String
     Dim sCMParsed As String
+    Dim nPredCM   As Long
+    Dim nColsCM   As Long
+    Dim nECCM     As Long
+    Dim sCMHdr    As String
+    Dim lCMHS     As Long
+    Dim nPred1    As Long
+    Dim nCols1    As Long
+    Dim nEC1      As Long
+    Dim sHdrR1    As String
     ' Pass 0: extract CMaps from ObjStm streams (PDF 1.5+).
     sCMapData = PDF_ExtractObjStmCMaps(bFile, sRaw)
     lCMScan = 1
@@ -104,9 +113,6 @@ Private Function PDF_ProcessAllStreams(bFile() As Byte, sRaw As String) As Strin
             For lCMBI = 0 To lCME - lCMS - 1
                 bCMRaw(lCMBI) = bFile(lCMS - 1 + lCMBI)
             Next lCMBI
-            Dim nPredCM As Long, nColsCM As Long, nECCM As Long
-            Dim sCMHdr  As String
-            Dim lCMHS   As Long
             lCMHS  = IIf(lCMPos - 512 < 1, 1, lCMPos - 512)
             sCMHdr = Mid$(sRaw, lCMHS, lCMPos - lCMHS)
             If InStr(1, sCMHdr, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
@@ -209,8 +215,6 @@ SkipCM:
                         bStream(iByte) = bFile(lStart - 1 + iByte)
                     Next iByte
 
-                    Dim nPred1 As Long, nCols1 As Long, nEC1 As Long
-                    Dim sHdrR1 As String
                     sHdrR1 = PDF_ResolveFilterRef(sHeader, sRaw)
                     If InStr(1, sHdrR1, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
                        InStr(1, sHdrR1, "/A85",           vbBinaryCompare) > 0 Then
@@ -278,6 +282,11 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
     Dim sParsed  As String
     Dim result   As String
     Dim iByte    As Long
+    Dim ch       As String
+    Dim nPredOS  As Long
+    Dim nColsOS  As Long
+    Dim nECOS    As Long
+    Dim sHdrR2   As String
 
     lSearch = 1
     Do
@@ -320,7 +329,7 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
             Loop
             lFEnd = lFPos
             Do While lFEnd <= Len(sHeader)
-                Dim ch As String: ch = Mid$(sHeader, lFEnd, 1)
+                ch = Mid$(sHeader, lFEnd, 1)
                 If ch >= "0" And ch <= "9" Then lFEnd = lFEnd + 1 Else Exit Do
             Loop
             If lFEnd > lFPos Then lFirst = CLng(Val(Mid$(sHeader, lFPos, lFEnd - lFPos)))
@@ -351,8 +360,6 @@ Private Function PDF_ExtractObjStmCMaps(bFile() As Byte, sRaw As String) As Stri
                 bRaw(iByte) = bFile(lStart - 1 + iByte)
             Next iByte
 
-            Dim nPredOS As Long, nColsOS As Long, nECOS As Long
-            Dim sHdrR2 As String
             sHdrR2 = PDF_ResolveFilterRef(sHeader, sRaw)
             If InStr(1, sHdrR2, "/ASCII85Decode", vbBinaryCompare) > 0 Or _
                InStr(1, sHdrR2, "/A85",           vbBinaryCompare) > 0 Then
