@@ -1,4 +1,3 @@
-Attribute VB_Name = "PdfTXT"
 Option Explicit
 
 Public Function PDF_ExtractText(ByVal sFilePath As String) As String
@@ -866,6 +865,10 @@ Fail:
     PDF_DecodeASCII85 = bFail
 End Function
 
+    Dim lCode     As Long
+    Dim bitsLeft  As Long
+    Dim take      As Long
+    Dim chainCode As Long
 Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean) As Byte()
     ' Decodes LZW-compressed data per PDF spec §7.4.4 / TIFF spec.
     ' bEarlyChange=True (PDF default): encoder adds code to table BEFORE bumping code width,
@@ -882,10 +885,6 @@ Private Function PDF_DecompressLZW(bIn() As Byte, ByVal bEarlyChange As Boolean)
     Const LZW_FIRST As Long = 258
     Const LZW_MAXCODES As Long = 4096  ' 12-bit cap
 
-    Dim lCode     As Long
-    Dim bitsLeft  As Long
-    Dim take      As Long
-    Dim chainCode As Long
     Dim lBitBuf  As Long
     Dim lBitCnt  As Long
     Dim lInPos   As Long
@@ -1086,6 +1085,7 @@ Fail:
     PDF_DecodeASCIIHex = bFail
 End Function
 
+    Dim repByte As Byte
 Private Function PDF_DecodeRunLength(bIn() As Byte) As Byte()
     ' Decodes a RunLengthDecode stream per PDF spec §7.4.5 (PackBits variant).
     ' Length byte semantics:
@@ -1093,7 +1093,6 @@ Private Function PDF_DecodeRunLength(bIn() As Byte) As Byte()
     '   129-255 : repeat the next byte (257 - length) times
     '   128    : end-of-data marker
     On Error GoTo Fail
-    Dim repByte As Byte
     Dim bFail(0) As Byte
     Dim nIn      As Long: nIn = UBound(bIn) + 1
     If nIn = 0 Then PDF_DecodeRunLength = bFail: Exit Function
@@ -1845,6 +1844,9 @@ Private Function PDF_ParseCMap(ByVal sCMap As String) As String
     Dim srcHi   As Long
     Dim dstBase As Long
     Dim k       As Long
+    Dim k2      As Long
+    Dim lBrack  As Long
+    Dim lBracketCheck As Long
     Dim sSrc    As String
     Dim sDst    As String
 
@@ -1885,16 +1887,45 @@ Private Function PDF_ParseCMap(ByVal sCMap As String) As String
             lAE = InStr(lA, sBlock, ">", vbBinaryCompare): If lAE = 0 Then Exit Do
             lB = InStr(lAE, sBlock, "<", vbBinaryCompare): If lB = 0 Then Exit Do
             lBE = InStr(lB, sBlock, ">", vbBinaryCompare): If lBE = 0 Then Exit Do
-            lC = InStr(lBE, sBlock, "<", vbBinaryCompare): If lC = 0 Then Exit Do
-            lCE = InStr(lC, sBlock, ">", vbBinaryCompare): If lCE = 0 Then Exit Do
             srcLo = CLng(val("&H" & Mid$(sBlock, lA + 1, lAE - lA - 1)))
             srcHi = CLng(val("&H" & Mid$(sBlock, lB + 1, lBE - lB - 1)))
-            dstBase = CLng(val("&H" & Mid$(sBlock, lC + 1, lCE - lC - 1)))
-            For k = 0 To srcHi - srcLo
-                If Len(result) > 0 Then result = result & Chr(1)
-                result = result & Hex(srcLo + k) & ">" & Hex(dstBase + k)
-            Next k
-            lA = lCE + 1
+            ' Third token is either "[<d0><d1>...]" (array form) or "<dstBase>" (scalar form).
+            ' Array form: each glyph srcLo+i maps directly to d_i (no incrementing).
+            ' Scalar form: srcLo+i maps to dstBase+i (contiguous run).
+            lC = InStr(lBE, sBlock, "<", vbBinaryCompare)
+            lBracketCheck = InStr(lBE, sBlock, "[", vbBinaryCompare)
+            If lBracketCheck <> 0 And (lC = 0 Or lBracketCheck < lC) Then
+                ' Array form: <srcLo> <srcHi> [<dst0> <dst1> ... <dstN>]
+                lC = lBracketCheck + 1  ' skip [
+                lBrack = InStr(lC, sBlock, "]", vbBinaryCompare)
+                If lBrack = 0 Then Exit Do
+                k2 = 0
+                Do While lC < lBrack And k2 <= srcHi - srcLo
+                    lC = InStr(lC, sBlock, "<", vbBinaryCompare)
+                    If lC = 0 Or lC >= lBrack Then Exit Do
+                    lCE = InStr(lC, sBlock, ">", vbBinaryCompare)
+                    If lCE = 0 Then Exit Do
+                    sDst = Mid$(sBlock, lC + 1, lCE - lC - 1)
+                    ' Strip whitespace (e.g. <0066 0069> = ligature fi, or \r\n line endings)
+                    sDst = Replace(Replace(Replace(Replace(sDst, " ", ""), Chr(9), ""), Chr(10), ""), Chr(13), "")
+                    If Len(result) > 0 Then result = result & Chr(1)
+                    result = result & Hex(srcLo + k2) & ">" & sDst
+                    k2 = k2 + 1
+                    lC = lCE + 1
+                Loop
+                lA = lBrack + 1
+            Else
+                ' Scalar form: <srcLo> <srcHi> <dstBase>
+                ' dstBase is incremented for each glyph in the range.
+                If lC = 0 Then Exit Do
+                lCE = InStr(lC, sBlock, ">", vbBinaryCompare): If lCE = 0 Then Exit Do
+                dstBase = CLng(val("&H" & Mid$(sBlock, lC + 1, lCE - lC - 1)))
+                For k = 0 To srcHi - srcLo
+                    If Len(result) > 0 Then result = result & Chr(1)
+                    result = result & Hex(srcLo + k) & ">" & Hex(dstBase + k)
+                Next k
+                lA = lCE + 1
+            End If
         Loop
         lPos = lEnd + 10
     Loop
@@ -2295,3 +2326,5 @@ Done:
 Fail:
     PDF_DiagnoseVerbose = out & vbLf & "[EXCEPTION] " & Err.Number & ": " & Err.Description
 End Function
+
+
