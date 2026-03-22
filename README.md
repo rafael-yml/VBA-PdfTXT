@@ -6,7 +6,7 @@ A pure VBA PDF text extraction library. No external dependencies, no DLLs, no CO
 
 ## Why this exists
 
-Every VBA approach to reading PDFs either requires a third-party library, shells out to an external process, or relies on Adobe Acrobat being installed. This module reads the file directly, decompresses the content streams with a from-scratch DEFLATE implementation, parses the text operators, and returns the text within the VBA runtime.
+Every VBA approach to reading PDFs either requires a third-party library, shells out to an external process, or relies on Adobe Acrobat being installed. This class reads the file directly, decompresses the content streams with a from-scratch DEFLATE implementation, parses the text operators, and returns the text within the VBA runtime.
 
 ---
 
@@ -34,13 +34,13 @@ Every VBA approach to reading PDFs either requires a third-party library, shells
 | **Encrypted PDFs** (password-protected) | Stream data is ciphertext; decryption requires AES/RC4: out of scope, use OCR fallback |
 | **Type 3 fonts without `/ToUnicode`** | Glyphs named `/a0`, `/a1`… have no standardised Unicode mapping; the character identity is only in the drawing procedures (Bézier paths / bitmaps): fundamentally undecipherable without the font author's intent. These runs produce empty output (not garbage). |
 | **Image-only PDFs** (scanned documents) | No text operators exist; OCR required |
-| **`bfrange` array destinations** | Rare CMap variant; silently produces missing characters, no crash |
+
 
 ---
 
 ## Installation
 
-1. In the VBA editor, go to **File → Import File** and select `PdfTXT.bas`
+1. In the VBA editor, go to **File → Import File** and select `PdfTXT.cls`
 2. That's it. No references to set, no extra modules needed.
 
 ---
@@ -48,11 +48,18 @@ Every VBA approach to reading PDFs either requires a third-party library, shells
 ## Usage
 
 ```vb
+Dim txt As New PdfTXT
 Dim sText As String
-sText = PDF_ExtractText("C:\path\to\file.pdf")
 
-If Len(sText) = 0 Then
-    ' Encrypted, image-only, or some issue reading it
+sText = txt.ExtractText("C:\path\to\file.pdf")
+
+If txt.LastStatus <> PDFTXT_OK Then
+    Select Case txt.LastStatus
+        Case PDFTXT_NO_TEXT:  ' Image-only PDF
+        Case PDFTXT_NO_CMAP:  ' Unmapped font
+        Case PDFTXT_GARBLED:  ' Partial CMap
+        Case PDFTXT_FAIL:     ' Encrypted, missing, or not a PDF
+    End Select
 Else
     Debug.Print sText
 End If
@@ -65,22 +72,59 @@ The returned string uses:
 
 ---
 
+## Status codes
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `PDFTXT_OK` | 0 | Clean text returned |
+| `PDFTXT_NO_TEXT` | 1 | No text operators found |
+| `PDFTXT_NO_CMAP` | 2 | Hex-encoded glyphs found but no ToUnicode CMap |
+| `PDFTXT_GARBLED` | 3 | CMap present but unmapped-glyph ratio too high |
+| `PDFTXT_FAIL` | 4 | File missing, not a PDF, encrypted, or parse error |
+
+---
+
+## Properties
+
+#### `LastStatus` → `Long`
+
+Status code from the most recent `ExtractText` call. Read-only.
+
+#### `GarbleThreshold` → `Double` (default `0.25`)
+
+Fraction of unmapped CID glyphs above which `LastStatus` returns `PDFTXT_GARBLED`. Real CMap failures are typically 80–100% unmapped. Valid range: `0 < value <= 1`.
+
+```vb
+txt.GarbleThreshold = 0.4  ' more tolerant
+```
+
+#### `LineTolerance` → `Long` (default `8`)
+
+Y-axis distance in PDF points within which two text runs are considered to be on the same line. Increase for large display text or loose line spacing; decrease for dense tables.
+
+```vb
+txt.LineTolerance = 5   ' tighter
+txt.LineTolerance = 12  ' looser
+```
+
 ## Diagnostics
 
-### PDF_DiagnoseStreams
+### DiagnoseStreams
 
 Lists every stream in the file with its position, length, content-stream classification, and the first 100 characters of its dictionary header. Useful for spotting encrypted, image-only, or unusual PDFs at a glance.
 
 ```vb
-Debug.Print PDF_DiagnoseStreams("C:\path\to\file.pdf")
+Dim txt As New PdfTXT
+Debug.Print txt.DiagnoseStreams("C:\path\to\file.pdf")
 ```
 
-### PDF_DiagnoseVerbose
+### DiagnoseVerbose
 
-Runs the full extraction pipeline step by step and reports what happens at each stage. Use this when `PDF_ExtractText` returns empty unexpectedly.
+Runs the full extraction pipeline step by step and reports what happens at each stage. Use this when `ExtractText` returns empty unexpectedly.
 
 ```vb
-Debug.Print PDF_DiagnoseVerbose("C:\path\to\file.pdf")
+Dim txt As New PdfTXT
+Debug.Print txt.DiagnoseVerbose("C:\path\to\file.pdf")
 ```
 
 Output stages:
@@ -102,12 +146,15 @@ If an exception occurs at any stage it is reported as `[EXCEPTION] Err=N: descri
 
 ## Architecture
 
-The module is a single `.bas` file with 26 functions. The public surface is three; everything else is internal.
+The class is a single `.cls` file. The public surface is six; everything else is internal.
 
 ```
-PDF_ExtractText          <- main entry point
-PDF_DiagnoseStreams      <- stream-listing diagnostic
-PDF_DiagnoseVerbose      <- step-by-step pipeline diagnostic
+ExtractText          <- main entry point
+LastStatus           <- property: status from last call
+GarbleThreshold      <- property: garbled detection threshold (default 0.25)
+LineTolerance        <- property: Y-axis line grouping tolerance in pts (default 8)
+DiagnoseStreams      <- stream-listing diagnostic
+DiagnoseVerbose      <- step-by-step pipeline diagnostic
 
 PDF_ReadFileBytes         reads raw file bytes into a Byte array
 PDF_BytesToLatin1         converts Byte array to a 1:1 character string
@@ -174,7 +221,7 @@ PDF_SortAndJoin           sorts positioned text runs into visual reading order
 
 **Two-column layouts**: labels and values on the same visual line are joined with a tab. Split on `Chr(9)` to get them as separate fields.
 
-**Line spacing tolerance**: two text runs are treated as the same line if their Y coordinates are within 8 PDF points. This handles most layouts comfortably. If you have a document with very tight superscripts or very wide line spacing that merges or splits incorrectly, adjust the `Y_TOL` constant in `PDF_SortAndJoin` (stored x100, so the default `800` = 8.0 points).
+**Line spacing tolerance**: two text runs are treated as the same line if their Y coordinates are within 8 PDF points. This handles most layouts comfortably. If you have a document with very tight superscripts or very wide line spacing that merges or splits incorrectly, adjust the `LineTolerance` property (default 8 points).
 
 **Windows code page**: `PDF_ApplyCMap` uses `Asc()` to recover byte values from VBA's internal string representation. This correctly round-trips all byte values on systems using a single-byte ANSI code page (CP1252, CP1250, etc.). Behaviour on DBCS code page systems (Japanese, Chinese, Korean) has not been tested.
 
@@ -184,7 +231,7 @@ PDF_SortAndJoin           sorts positioned text runs into visual reading order
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
