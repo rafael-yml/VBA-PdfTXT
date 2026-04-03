@@ -12,11 +12,11 @@ Option Explicit
 ' ---------------------------------------------------------------------------
 ' Status codes returned by the LastStatus property after each ExtractText call.
 ' ---------------------------------------------------------------------------
-Public Const PDFTXT_OK      As Long = 0  ' clean text returned
-Public Const PDFTXT_NO_TEXT As Long = 1  ' no text operators found (image-only or blank PDF)
-Public Const PDFTXT_NO_CMAP As Long = 2  ' hex-encoded glyphs found but no ToUnicode CMap
-Public Const PDFTXT_GARBLED As Long = 3  ' CMap present but unmapped-glyph ratio too high
-Public Const PDFTXT_FAIL    As Long = 4  ' file missing, not a PDF, encrypted, or parse error
+Private Const PDFTXT_OK      As Long = 0  ' clean text returned
+Private Const PDFTXT_NO_TEXT As Long = 1  ' no text operators found (image-only or blank PDF)
+Private Const PDFTXT_NO_CMAP As Long = 2  ' hex-encoded glyphs found but no ToUnicode CMap
+Private Const PDFTXT_GARBLED As Long = 3  ' CMap present but unmapped-glyph ratio too high
+Private Const PDFTXT_FAIL    As Long = 4  ' file missing, not a PDF, encrypted, or parse error
 
 ' ---------------------------------------------------------------------------
 ' Instance state
