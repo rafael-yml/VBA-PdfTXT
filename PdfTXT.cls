@@ -84,7 +84,7 @@ Public Function ExtractText(ByVal sFilePath As String) As String
     result = PDF_ProcessAllStreams(bFile, sRaw)
 
     m_lStatus = PDF_CheckStatus(result)
-    If m_lStatus = PDFTXT_OK Then
+    If m_lStatus <> PDFTXT_FAIL Then
         ExtractText = result
     End If
     Exit Function
@@ -668,11 +668,7 @@ Private Function PDF_ApplyPredictor(bData() As Byte, _
                         bOut(outOff + col) = CByte((raw + b) And 255)
                     Case 3  ' Average: add floor((left + above) / 2)
                         bOut(outOff + col) = CByte((raw + (a + b) \ 2) And 255)
-                    Case 4  ' PaethDim p  As Long: p  = a + b - c
-                        pa = Abs(p - a)
-                        pb = Abs(p - b)
-                        pc = Abs(p - c)
-                        
+                    Case 4  ' Paeth predictor (RFC 2083 Section 6.6)
                         p = a + b - c
                         pa = Abs(p - a)
                         pb = Abs(p - b)
@@ -1609,6 +1605,12 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
     Dim sTokArr  As Variant
     Dim nArr     As Long
     Dim tokIsHex() As Boolean  ' True when token came from <hex> string (needs CMap); False for (literal)
+    Dim ctmTX    As Double   ' accumulated CTM x-translation from cm operators
+    Dim ctmTY    As Double   ' accumulated CTM y-translation from cm operators
+    Dim cAcm     As String   ' char after "cm" keyword, used for operator boundary check
+    Dim ctmStackX(31) As Double  ' graphics state save stack for CTM tx (q/Q), max depth 32
+    Dim ctmStackY(31) As Double  ' graphics state save stack for CTM ty (q/Q), max depth 32
+    Dim ctmDepth      As Long    ' current q nesting depth
 
     curLead = 12
     lLen = Len(sStream)
@@ -1731,8 +1733,8 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                             sRunOut = tokens(tCount - 1)
                         End If
                         If Len(Trim$(sRunOut)) > 0 Then
-                            emitY = CLng(curY * 100)
-                            result = result & CStr(emitY) & "|" & CStr(CLng(curX * 100)) & "|" & sRunOut & Chr(2)
+                            emitY = CLng((curY + ctmTY) * 100)
+                            result = result & CStr(emitY) & "|" & CStr(CLng((curX + ctmTX) * 100)) & "|" & sRunOut & Chr(2)
                         End If
                     End If
                     tCount = 0: i = i + 2: GoTo NextChar
@@ -1746,8 +1748,8 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                         End If
                     Next k
                     If Len(Trim$(sRunOut)) > 0 Then
-                        emitY = CLng(curY * 100)
-                        result = result & CStr(emitY) & "|" & CStr(CLng(curX * 100)) & "|" & sRunOut & Chr(2)
+                        emitY = CLng((curY + ctmTY) * 100)
+                        result = result & CStr(emitY) & "|" & CStr(CLng((curX + ctmTX) * 100)) & "|" & sRunOut & Chr(2)
                     End If
                     tCount = 0: i = i + 2: GoTo NextChar
                 Case "m"  ' Tm: set text matrix; last two numerics are X Y
@@ -1793,8 +1795,8 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                     sRunOut = tokens(tCount - 1)
                 End If
                 If Len(Trim$(sRunOut)) > 0 Then
-                    emitY = CLng(curY * 100)
-                    result = result & CStr(emitY) & "|" & CStr(CLng(curX * 100)) & "|" & sRunOut & Chr(2)
+                    emitY = CLng((curY + ctmTY) * 100)
+                    result = result & CStr(emitY) & "|" & CStr(CLng((curX + ctmTX) * 100)) & "|" & sRunOut & Chr(2)
                 End If
                 tCount = 0
             End If
@@ -1812,8 +1814,8 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                     sRunOut = tokens(tCount - 1)
                 End If
                 If Len(Trim$(sRunOut)) > 0 Then
-                    emitY = CLng(curY * 100)
-                    result = result & CStr(emitY) & "|" & CStr(CLng(curX * 100)) & "|" & sRunOut & Chr(2)
+                    emitY = CLng((curY + ctmTY) * 100)
+                    result = result & CStr(emitY) & "|" & CStr(CLng((curX + ctmTX) * 100)) & "|" & sRunOut & Chr(2)
                 End If
                 tCount = 0
             End If
@@ -1839,6 +1841,59 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                 End If
             End If
             GoTo NextChar
+
+        Case "q"
+            ' Save graphics state: push current CTM translation onto stack
+            If i + 1 <= lLen Then
+                Dim cAq As String
+                cAq = Mid$(sStream, i + 1, 1)
+                If cAq = " " Or cAq = Chr(9) Or cAq = Chr(10) Or cAq = Chr(13) Then
+                    If ctmDepth <= 30 Then
+                        ctmStackX(ctmDepth) = ctmTX
+                        ctmStackY(ctmDepth) = ctmTY
+                        ctmDepth = ctmDepth + 1
+                    End If
+                    nTok = 0: sTok = "": tCount = 0
+                    i = i + 1: GoTo NextChar
+                End If
+            End If
+
+        Case "Q"
+            ' Restore graphics state: pop CTM translation from stack
+            If i + 1 <= lLen Then
+                Dim cAQ As String
+                cAQ = Mid$(sStream, i + 1, 1)
+                If cAQ = " " Or cAQ = Chr(9) Or cAQ = Chr(10) Or cAQ = Chr(13) Then
+                    If ctmDepth > 0 Then
+                        ctmDepth = ctmDepth - 1
+                        ctmTX = ctmStackX(ctmDepth)
+                        ctmTY = ctmStackY(ctmDepth)
+                    End If
+                    nTok = 0: sTok = "": tCount = 0
+                    i = i + 1: GoTo NextChar
+                End If
+            End If
+
+        Case "c"
+            ' "cm" operator: concatenate matrix to CTM. We track only the translation
+            ' components (5th and 6th operands, i.e. e and f) because generators like
+            ' IBM AFP2PDF only use translation-only cm ops to flip the coordinate origin.
+            If i + 1 <= lLen Then
+                If Mid$(sStream, i + 1, 1) = "m" Then
+                    If i + 2 <= lLen Then cAcm = Mid$(sStream, i + 2, 1) Else cAcm = " "
+                    If cAcm = " " Or cAcm = Chr(9) Or cAcm = Chr(10) Or cAcm = Chr(13) Then
+                        If Len(sTok) > 0 Then sTok = Left$(sTok, Len(sTok) - 1)
+                        sTokArr = Split(sTok, Chr(3))
+                        nArr = UBound(sTokArr)
+                        If nArr >= 5 Then
+                            ctmTX = ctmTX + val(sTokArr(nArr - 1))
+                            ctmTY = ctmTY + val(sTokArr(nArr))
+                        End If
+                        nTok = 0: sTok = "": tCount = 0
+                        i = i + 2: GoTo NextChar
+                    End If
+                End If
+            End If
 
         Case Chr(10), Chr(13)
             If tCount > 512 Then tCount = 0
@@ -2168,8 +2223,10 @@ NextRun:
 
     ' Y>20000 (>200 pts scaled *100) = standard PDF coords (origin bottom-left, descending sort).
     ' Y<=20000 = flipped CTM (origin top-left, ascending sort).
-    maxY = 0
-    For i = 0 To n - 1
+    ' Seed from arrY(0) so an all-negative array (CTM-flipped before cm fix) still
+    ' produces a correct maxY rather than being clamped at 0.
+    maxY = arrY(0)
+    For i = 1 To n - 1
         If arrY(i) > maxY Then maxY = arrY(i)
     Next i
     bDescend = (maxY > 20000)   ' 200 points * 100
@@ -2182,7 +2239,7 @@ NextRun:
             Else
                 doSwap = arrY(i) > arrY(i + 1)
             End If
-            If arrY(i) = arrY(i + 1) Then
+            If Abs(arrY(i) - arrY(i + 1)) <= m_lYTol Then
                 doSwap = arrX(i) > arrX(i + 1)
             End If
             If doSwap Then
