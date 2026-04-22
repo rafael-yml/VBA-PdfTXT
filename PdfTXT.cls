@@ -243,6 +243,11 @@ SkipCM:
     sAllRuns = ""
     lSearch = 1
 
+    ' Build CMap Dictionary once for all streams - O(1) lookup vs O(n) linear scan
+    Dim dCMapPS    As Object
+    Dim bTwoBytePS As Boolean
+    Set dCMapPS = PDF_BuildCMapDict(sCMapData, bTwoBytePS)
+
     Do
         lPos = InStr(lSearch, sRaw, "stream", vbBinaryCompare)
         If lPos = 0 Then Exit Do
@@ -326,7 +331,7 @@ SkipCM:
                     End If
 
                     If UBound(bStream) > 0 Then
-                        sText = PDF_ExtractTextOps(PDF_BytesToLatin1(bStream), sCMapData)
+                        sText = PDF_ExtractTextOps(PDF_BytesToLatin1(bStream), sCMapData, dCMapPS)
                         If Len(sText) > 0 Then
                             If Len(sAllRuns) > 0 Then sAllRuns = sAllRuns & Chr(2)
                             sAllRuns = sAllRuns & sText
@@ -340,8 +345,10 @@ SkipCM:
     Loop
 
     PDF_ProcessAllStreams = PDF_CleanText(PDF_SortAndJoin(sAllRuns))
+    Set dCMapPS = Nothing
     Exit Function
 ProcFail:
+    Set dCMapPS = Nothing
     If Len(sAllRuns) > 0 Then
         PDF_ProcessAllStreams = PDF_CleanText(PDF_SortAndJoin(sAllRuns))
     End If
@@ -1572,7 +1579,7 @@ Private Function INF_DecodeHuff(bIn() As Byte, lInPos As Long, _
     INF_DecodeHuff = -1  ' error
 End Function
 
-Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As String) As String
+Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As String, ByVal dCMap As Object) As String
     Dim i        As Long
     Dim lLen     As Long
     Dim c        As String
@@ -1728,7 +1735,7 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                 Case "j"
                     If tCount > 0 Then
                         If Len(sCMap) > 0 And tokIsHex(tCount - 1) Then
-                            sRunOut = PDF_ApplyCMap(sCMap, tokens(tCount - 1))
+                            sRunOut = PDF_ApplyCMap(sCMap, tokens(tCount - 1), dCMap)
                         Else
                             sRunOut = tokens(tCount - 1)
                         End If
@@ -1742,7 +1749,7 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
                     sRunOut = ""
                     For k = 0 To tCount - 1
                         If Len(sCMap) > 0 And tokIsHex(k) Then
-                            sRunOut = sRunOut & PDF_ApplyCMap(sCMap, tokens(k))
+                            sRunOut = sRunOut & PDF_ApplyCMap(sCMap, tokens(k), dCMap)
                         Else
                             sRunOut = sRunOut & tokens(k)
                         End If
@@ -1790,7 +1797,7 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
             If tCount > 0 Then
                 curY = curY - curLead
                 If Len(sCMap) > 0 And tokIsHex(tCount - 1) Then
-                    sRunOut = PDF_ApplyCMap(sCMap, tokens(tCount - 1))
+                    sRunOut = PDF_ApplyCMap(sCMap, tokens(tCount - 1), dCMap)
                 Else
                     sRunOut = tokens(tCount - 1)
                 End If
@@ -1809,7 +1816,7 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
             If tCount > 0 Then
                 curY = curY - curLead
                 If Len(sCMap) > 0 And tokIsHex(tCount - 1) Then
-                    sRunOut = PDF_ApplyCMap(sCMap, tokens(tCount - 1))
+                    sRunOut = PDF_ApplyCMap(sCMap, tokens(tCount - 1), dCMap)
                 Else
                     sRunOut = tokens(tCount - 1)
                 End If
@@ -2072,39 +2079,91 @@ Private Function PDF_ParseCMap(ByVal sCMap As String) As String
     PDF_ParseCMap = result
 End Function
 
-Private Function PDF_ApplyCMap(ByVal sCMapData As String, ByVal sRaw As String) As String
-    ' Auto-detects 1-byte vs 2-byte CID mode (any src code > 255 -> 2-byte).
-    Dim result  As String
-    Dim i       As Long
-    Dim cid     As Long
-    Dim j       As Long
-    Dim found   As Boolean
-    Dim nPairs  As Long
+Private Function PDF_BuildCMapDict(ByVal sCMapData As String, ByRef bTwoByte As Boolean) As Object
+    ' Builds a Scripting.Dictionary from the parsed CMap string for O(1) per-glyph lookup.
+    ' Key   = CID as String (e.g. "255", "1234")
+    ' Value = destination hex string as stored by PDF_ParseCMap (e.g. "0041", "00660069")
+    ' bTwoByte is set True if any src CID > 255 (2-byte CID font).
+    Dim dict    As Object
     Dim pairs() As String
-    Dim src()   As Long
-    Dim dst()   As String
+    Dim j       As Long
     Dim sepPos  As Long
-    Dim dstHex  As String
+    Dim cidVal  As Long
+
+    Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = 0  ' vbBinaryCompare
+
+    bTwoByte = False
+    If Len(sCMapData) = 0 Then
+        Set PDF_BuildCMapDict = dict
+        Exit Function
+    End If
+
+    pairs = Split(sCMapData, Chr(1))
+    For j = 0 To UBound(pairs)
+        sepPos = InStr(pairs(j), ">")
+        If sepPos > 0 Then
+            cidVal = CLng(val("&H" & Left$(pairs(j), sepPos - 1)))
+            If cidVal > 255 Then bTwoByte = True
+            Dim sKey As String
+            sKey = CStr(cidVal)
+            If Not dict.Exists(sKey) Then
+                dict.Add sKey, Mid$(pairs(j), sepPos + 1)
+            End If
+        End If
+    Next j
+
+    Set PDF_BuildCMapDict = dict
+End Function
+
+Private Function PDF_ApplyCMap(ByVal sCMapData As String, ByVal sRaw As String, ByVal dCMap As Object) As String
+    ' Uses dCMap (Scripting.Dictionary) for O(1) per-glyph lookup when available.
+    ' Falls back to linear scan of sCMapData when dCMap is Nothing (e.g. DiagnoseVerbose).
+    ' Auto-detects 1-byte vs 2-byte CID mode.
+    Dim result   As String
+    Dim i        As Long
+    Dim cid      As Long
+    Dim j        As Long
+    Dim found    As Boolean
+    Dim nPairs   As Long
+    Dim pairs()  As String
+    Dim src()    As Long
+    Dim dst()    As String
+    Dim sepPos   As Long
+    Dim dstHex   As String
     Dim bTwoByte As Boolean
+    Dim sKey     As String
+    Dim bUseDict As Boolean
+    Dim oKey     As Variant
 
     If Len(sCMapData) = 0 Or Len(sRaw) = 0 Then
         PDF_ApplyCMap = sRaw: Exit Function
     End If
 
-    pairs = Split(sCMapData, Chr(1))
-    nPairs = UBound(pairs) + 1
-    ReDim src(0 To nPairs - 1)
-    ReDim dst(0 To nPairs - 1)
-    bTwoByte = False
-    For j = 0 To nPairs - 1
-        sepPos = InStr(pairs(j), ">")
-        If sepPos > 0 Then
-            src(j) = CLng(val("&H" & Left$(pairs(j), sepPos - 1)))
-            dstHex = Mid$(pairs(j), sepPos + 1)
-            dst(j) = dstHex
-            If src(j) > 255 Then bTwoByte = True
-        End If
-    Next j
+    bUseDict = Not (dCMap Is Nothing)
+
+    If bUseDict Then
+        ' bTwoByte: scan keys once for any CID > 255
+        bTwoByte = False
+        For Each oKey In dCMap.Keys
+            If CLng(oKey) > 255 Then bTwoByte = True: Exit For
+        Next oKey
+    Else
+        ' Build linear arrays for fallback scan
+        pairs = Split(sCMapData, Chr(1))
+        nPairs = UBound(pairs) + 1
+        ReDim src(0 To nPairs - 1)
+        ReDim dst(0 To nPairs - 1)
+        bTwoByte = False
+        For j = 0 To nPairs - 1
+            sepPos = InStr(pairs(j), ">")
+            If sepPos > 0 Then
+                src(j) = CLng(val("&H" & Left$(pairs(j), sepPos - 1)))
+                dst(j) = Mid$(pairs(j), sepPos + 1)
+                If src(j) > 255 Then bTwoByte = True
+            End If
+        Next j
+    End If
 
     If bTwoByte And Len(sRaw) < 2 Then
         PDF_ApplyCMap = sRaw: Exit Function
@@ -2118,17 +2177,33 @@ Private Function PDF_ApplyCMap(ByVal sCMapData As String, ByVal sRaw As String) 
         Else
             cid = Asc(Mid$(sRaw, i, 1))
         End If
+
         found = False
-        For j = 0 To nPairs - 1
-            If src(j) = cid Then
-                If Len(dst(j)) = 8 Then
-                    result = result & ChrW(val("&H" & Left$(dst(j), 4))) & ChrW(val("&H" & Right$(dst(j), 4)))
-                ElseIf Len(dst(j)) > 0 Then
-                    If val("&H" & dst(j)) > 0 Then result = result & ChrW(val("&H" & dst(j)))
+        sKey = CStr(cid)
+
+        If bUseDict Then
+            If dCMap.Exists(sKey) Then
+                dstHex = dCMap(sKey)
+                If Len(dstHex) = 8 Then
+                    result = result & ChrW(val("&H" & Left$(dstHex, 4))) & ChrW(val("&H" & Right$(dstHex, 4)))
+                ElseIf Len(dstHex) > 0 Then
+                    If val("&H" & dstHex) > 0 Then result = result & ChrW(val("&H" & dstHex))
                 End If
-                found = True: Exit For
+                found = True
             End If
-        Next j
+        Else
+            For j = 0 To nPairs - 1
+                If src(j) = cid Then
+                    If Len(dst(j)) = 8 Then
+                        result = result & ChrW(val("&H" & Left$(dst(j), 4))) & ChrW(val("&H" & Right$(dst(j), 4)))
+                    ElseIf Len(dst(j)) > 0 Then
+                        If val("&H" & dst(j)) > 0 Then result = result & ChrW(val("&H" & dst(j)))
+                    End If
+                    found = True: Exit For
+                End If
+            Next j
+        End If
+
         m_lCIDTotal = m_lCIDTotal + 1
         If found Then
             m_lCIDMapped = m_lCIDMapped + 1
@@ -2462,7 +2537,7 @@ Public Function DiagnoseVerbose(ByVal sFilePath As String) As String
             sDecomp = PDF_BytesToLatin1(bDec)
             out = out & "  [S5] DecompLen=" & Len(sDecomp) & " First80=[" & Left$(sDecomp, 80) & "]" & vbLf
 
-            sText = PDF_ExtractTextOps(sDecomp, sCMap)
+            sText = PDF_ExtractTextOps(sDecomp, sCMap, Nothing)
             out = out & "  [S5] RunBytes=" & Len(sText) & vbLf
 
             If Len(sText) > 0 Then
