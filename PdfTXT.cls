@@ -1580,44 +1580,45 @@ Private Function INF_DecodeHuff(bIn() As Byte, lInPos As Long, _
 End Function
 
 Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As String, ByVal dCMap As Object) As String
-    Dim i        As Long
-    Dim lLen     As Long
-    Dim c        As String
-    Dim result   As String
-    Dim tokens() As String
-    Dim tCount   As Long
-    Dim cABT     As String
-    Dim cAET     As String
-    Dim sLit     As String
-    Dim depth    As Long
-    Dim cl       As String
-    Dim cE       As String
-    Dim sO       As String
-    Dim o2       As String
-    Dim o3       As String
-    Dim sHx      As String
-    Dim hc       As String
-    Dim op       As String
-    Dim k        As Long
-    Dim curX     As Double
-    Dim curY     As Double
-    Dim curLead  As Double
-    Dim nTok     As Long
-    Dim sTok     As String
-    Dim nc       As String
-    Dim sNum     As String
-    Dim trimP    As Long
-    Dim sRunOut  As String
-    Dim emitY    As Long
-    Dim sTokArr  As Variant
-    Dim nArr     As Long
-    Dim tokIsHex() As Boolean  ' True when token came from <hex> string (needs CMap); False for (literal)
-    Dim ctmTX    As Double   ' accumulated CTM x-translation from cm operators
-    Dim ctmTY    As Double   ' accumulated CTM y-translation from cm operators
-    Dim cAcm     As String   ' char after "cm" keyword, used for operator boundary check
+    Dim i             As Long
+    Dim lLen          As Long
+    Dim c             As String
+    Dim result        As String
+    Dim tokens()      As String
+    Dim tCount        As Long
+    Dim cABT          As String
+    Dim cAET          As String
+    Dim sLit          As String
+    Dim depth         As Long
+    Dim cl            As String
+    Dim cE            As String
+    Dim sO            As String
+    Dim o2            As String
+    Dim o3            As String
+    Dim sHx           As String
+    Dim hc            As String
+    Dim op            As String
+    Dim k             As Long
+    Dim curX          As Double
+    Dim curY          As Double
+    Dim curLead       As Double
+    Dim nTok          As Long
+    Dim sTok          As String
+    Dim nc            As String
+    Dim sNum          As String
+    Dim trimP         As Long
+    Dim sRunOut       As String
+    Dim emitY         As Long
+    Dim sTokArr       As Variant
+    Dim nArr          As Long
+    Dim tokIsHex()    As Boolean  ' True when token came from <hex> string (needs CMap); False for (literal)
+    Dim ctmTX         As Double   ' accumulated CTM x-translation from cm operators
+    Dim ctmTY         As Double   ' accumulated CTM y-translation from cm operators
+    Dim cAcm          As String   ' char after "cm" keyword, used for operator boundary check
     Dim ctmStackX(31) As Double  ' graphics state save stack for CTM tx (q/Q), max depth 32
     Dim ctmStackY(31) As Double  ' graphics state save stack for CTM ty (q/Q), max depth 32
     Dim ctmDepth      As Long    ' current q nesting depth
+    Dim cAq           As String
 
     curLead = 12
     lLen = Len(sStream)
@@ -1852,7 +1853,6 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
         Case "q"
             ' Save graphics state: push current CTM translation onto stack
             If i + 1 <= lLen Then
-                Dim cAq As String
                 cAq = Mid$(sStream, i + 1, 1)
                 If cAq = " " Or cAq = Chr(9) Or cAq = Chr(10) Or cAq = Chr(13) Then
                     If ctmDepth <= 30 Then
@@ -1868,7 +1868,6 @@ Private Function PDF_ExtractTextOps(ByVal sStream As String, ByVal sCMap As Stri
         Case "Q"
             ' Restore graphics state: pop CTM translation from stack
             If i + 1 <= lLen Then
-                Dim cAQ As String
                 cAQ = Mid$(sStream, i + 1, 1)
                 If cAQ = " " Or cAQ = Chr(9) Or cAQ = Chr(10) Or cAQ = Chr(13) Then
                     If ctmDepth > 0 Then
